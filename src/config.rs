@@ -234,7 +234,7 @@ pub struct Config {
 }
 
 impl Config {
-    fn from_str(s: &str) -> Result<Config> {
+    pub fn from_str(s: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
 
         if let Some(server) = config.server.as_mut() {

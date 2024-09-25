@@ -1,6 +1,6 @@
 mod cli;
 mod config;
-mod config_watcher;
+pub mod config_watcher;
 mod constants;
 mod helper;
 mod multi_map;
@@ -159,6 +159,26 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
     } else {
         Undetermine
     }
+}
+
+pub async fn run_from_str(config_str: &str) -> Result<()> {
+    let config = Config::from_str(config_str)?;
+
+    let args = Cli {
+        config_path: None,
+        server: false,
+        client: true,
+        genkey: None,
+    };
+
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let (_service_update_tx, service_update_rx) = mpsc::channel(1024);
+
+    let result = run_instance(config, args, shutdown_rx, service_update_rx).await;
+
+    let _ = shutdown_tx.send(true);
+
+    result
 }
 
 #[cfg(test)]

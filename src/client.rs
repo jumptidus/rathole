@@ -554,6 +554,7 @@ impl ControlChannelHandle {
     }
 
     fn shutdown(self) {
+        info!("Received shutdown signal!");
         // A send failure shows that the actor has already shutdown.
         let _ = self.shutdown_tx.send(0u8);
     }

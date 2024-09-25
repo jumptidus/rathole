@@ -161,7 +161,7 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
     }
 }
 
-pub async fn run_from_str(config_str: &str) -> Result<()> {
+pub async fn run_from_str(config_str: &str, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     let config = Config::from_str(config_str)?;
 
     let args = Cli {
@@ -171,14 +171,9 @@ pub async fn run_from_str(config_str: &str) -> Result<()> {
         genkey: None,
     };
 
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let (_service_update_tx, service_update_rx) = mpsc::channel(1024);
 
-    let result = run_instance(config, args, shutdown_rx, service_update_rx).await;
-
-    let _ = shutdown_tx.send(true);
-
-    result
+    run_instance(config, args, shutdown_rx, service_update_rx).await
 }
 
 #[cfg(test)]

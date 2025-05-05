@@ -5,7 +5,7 @@ use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
+    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
@@ -15,6 +15,7 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
@@ -36,6 +37,7 @@ type Nonce = protocol::Digest; // Also called `session_key`
 const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
 const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
+const DATA_CHANNEL_REQUEST_BUFFER: usize = CHAN_SIZE / 2; // Buffer for pending data channel requests
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 // The entrypoint of running a server
@@ -99,7 +101,7 @@ struct Server<T: Transport> {
 
     // `[server.services]` config, indexed by ServiceDigest
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
-    // Collection of contorl channels
+    // Collection of control channels
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
@@ -145,7 +147,7 @@ impl<T: 'static + Transport> Server<T> {
             .with_context(|| "Failed to listen at `server.bind_addr`")?;
         info!("Listening at {}", self.config.bind_addr);
 
-        // Retry at least every 100ms
+        // Retry at least every 100 ms
         let mut backoff = ExponentialBackoff {
             max_interval: Duration::from_millis(100),
             max_elapsed_time: None,
@@ -174,7 +176,7 @@ impl<T: 'static + Transport> Server<T> {
                                 }
                             }
                             // If it's not an IO error, then it comes from
-                            // the transport layer, so just ignore it
+                            // the transport layer, so ignore it
                         }
                         Ok((conn, addr)) => {
                             backoff.reset();
@@ -206,7 +208,7 @@ impl<T: 'static + Transport> Server<T> {
                 },
                 // Wait for the shutdown signal
                 _ = shutdown_rx.recv() => {
-                    info!("Shuting down gracefully...");
+                    info!("Shutting down gracefully...");
                     break;
                 },
                 e = update_rx.recv() => {
@@ -289,7 +291,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     rand::thread_rng().fill_bytes(&mut nonce);
 
     // Send hello
-    let hello_send = Hello::ControlChannelHello(
+    let hello_send = ControlChannelHello(
         protocol::CURRENT_PROTO_VERSION,
         nonce.clone().try_into().unwrap(),
     );
@@ -308,7 +310,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     }
     .to_owned();
 
-    let service_name = &service_config.name;
+    let service_name = service_config.name.clone();
 
     // Calculate the checksum
     let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
@@ -329,30 +331,96 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         );
         bail!("Service {} failed the authentication", service_name);
     } else {
-        let mut h = control_channels.write().await;
+        // 1. Prepare Handle and Control Task Future
+        let (handle, control_task_future) = ControlChannelHandle::prepare(
+            conn,
+            service_config.clone(),
+            server_config.heartbeat_interval,
+        );
 
-        // If there's already a control channel for the service, then drop the old one.
-        // Because a control channel doesn't report back when it's dead,
-        // the handle in the map could be stall, dropping the old handle enables
-        // the client to reconnect.
-        if h.remove1(&service_digest).is_some() {
-            warn!(
-                "Dropping previous control channel for service {}",
-                service_name
-            );
+        let nonce_for_cleanup = session_key;
+        let control_channels_weak = Arc::downgrade(&control_channels);
+
+        // 2. Insert Handle into the Map (within a write lock scope)
+        {
+            let mut control_map_guard = control_channels.write().await;
+
+            // Optional: Check for existing nonce/service_digest and handle collision/stale entry
+            // Use getX().is_some() and explicitly remove before insert.
+            if control_map_guard.get2(&nonce_for_cleanup).is_some() {
+                warn!(
+                    service = %service_name, nonce = %hex::encode(nonce_for_cleanup),
+                    "Nonce collision or potentially stale entry detected during insertion. Removing old entry before inserting."
+                );
+                // Explicitly remove the entry associated with the colliding nonce
+                let _ = control_map_guard.remove2(&nonce_for_cleanup);
+            } else if control_map_guard.get1(&service_digest).is_some() {
+                warn!(
+                   service = %service_name,
+                   "Existing control channel found for service digest during insertion. Removing old entry before inserting."
+                );
+                // Explicitly remove the entry associated with the colliding service digest
+                let _ = control_map_guard.remove1(&service_digest);
+            }
+
+            // Insert the new handle. `handle` is moved into the map.
+            let _ = control_map_guard.insert(service_digest, nonce_for_cleanup, handle);
+            info!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "Control channel handle inserted.");
         }
 
-        // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-            .await?;
-        conn.flush().await?;
+        // Clone names again for the spans, as the original is moved into the tasks
+        let service_name_for_control_span = service_name.clone();
+        let nonce_for_control_span = nonce_for_cleanup;
 
-        info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        // 3. Spawn the Main Control Task
+        let control_task_handle = tokio::spawn(
+            async move {
+                // The future returned by `prepare`
+                // owns the connection and runs `ControlChannel::run`
+                if let Err(err) = control_task_future.await {
+                    // Use moved variables inside the task
+                    error!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "Control channel task failed: {:#}", err);
+                } else {
+                    debug!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "Control channel task finished successfully.");
+                }
+            }
+            // Instrument the task - Use the newly cloned variables for the span
+            .instrument(info_span!("control_task", service = %service_name_for_control_span, nonce = %hex::encode(nonce_for_control_span))),
+        );
 
-        // Insert the new handle
-        let _ = h.insert(service_digest, session_key, handle);
+        // Clone nonce again specifically for the cleanup task's span
+        let nonce_for_cleanup_span_only = nonce_for_cleanup;
+
+        // 4. Spawn the Cleanup Task
+        tokio::spawn(
+            async move {
+                // Wait for the main control task to complete (normally or abnormally)
+                match control_task_handle.await {
+                    Ok(_) => {
+                        // Use moved nonce inside
+                        debug!(nonce = %hex::encode(nonce_for_cleanup), "Control task joined. Proceeding with cleanup.");
+                    },
+                    Err(e) => {
+                        // Use moved nonce inside
+                        error!(nonce = %hex::encode(nonce_for_cleanup), "Control task join failed (panicked or cancelled): {}. Attempting cleanup.", e);
+                    }
+                }
+
+                if let Some(map_arc) = control_channels_weak.upgrade() {
+                    debug!(nonce = %hex::encode(nonce_for_cleanup), "Acquiring lock for cleanup.");
+                    let mut map_guard = map_arc.write().await;
+                    if let Some(_removed_handle) = map_guard.remove2(&nonce_for_cleanup) {
+                        info!(nonce = %hex::encode(nonce_for_cleanup), "Control channel handle removed successfully.");
+                    } else {
+                        warn!(nonce = %hex::encode(nonce_for_cleanup), "Control channel handle already removed before cleanup task ran.");
+                    }
+                } else {
+                    warn!(nonce = %hex::encode(nonce_for_cleanup), "Control channel map was dropped before cleanup could run.");
+                }
+            }
+            // Instrument the cleanup task - Use the span-specific cloned nonce
+            .instrument(info_span!("cleanup_task", nonce = %hex::encode(nonce_for_cleanup_span_only))),
+        );
     }
 
     Ok(())
@@ -396,104 +464,119 @@ impl<T> ControlChannelHandle<T>
 where
     T: 'static + Transport,
 {
-    // Create a control channel handle, where the control channel handling task
-    // and the connection pool task are created.
-    #[instrument(name = "handle", skip_all, fields(service = %service.name))]
-    fn new(
+    // Renamed `new` to `prepare`.
+    // Returns the handle instance and a Future that runs the control channel logic.
+    #[instrument(name = "handle_prepare", skip_all, fields(service = %service.name))]
+    fn prepare(
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
-    ) -> ControlChannelHandle<T> {
-        // Create a shutdown channel
+    ) -> (Self, impl Future<Output = Result<()>> + Send + 'static) {
+        // Create shutdown channel, data channel queue, request channel (Bounded now)
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
-
-        // Store data channels
         let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2);
+        let (data_ch_req_tx, data_ch_req_rx) = mpsc::channel(DATA_CHANNEL_REQUEST_BUFFER);
 
-        // Store data channel creation requests
-        let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
-
-        // Cache some data channels for later use
+        // Calculate pool size (remains the same)
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
         };
 
-        for _i in 0..pool_size {
-            if let Err(e) = data_ch_req_tx.send(true) {
-                error!("Failed to request data channel {}", e);
-            };
-        }
+        // Spawn a connection pool task (remains the same, takes ownership of relevant channels)
+        let service_name_clone = service.name.clone();
 
-        let shutdown_rx_clone = shutdown_tx.subscribe();
-        let bind_addr = service.bind_addr.clone();
+        // Clone name again for spans before moving into tasks
+        let service_name_for_tcp_span = service_name_clone.clone();
+        let service_name_for_udp_span = service_name_clone.clone();
+
         match service.service_type {
-            ServiceType::Tcp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_tcp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
+            ServiceType::Tcp => {
+                let shutdown_rx_clone = shutdown_tx.subscribe();
+                let bind_addr = service.bind_addr.clone();
+                let data_ch_req_tx_clone = data_ch_req_tx.clone(); // Clone sender for the pool task
+                tokio::spawn(
+                    async move {
+                        // Use moved service_name_clone inside a task
+                        if let Err(e) = run_tcp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx, // data_ch_rx moved here
+                            data_ch_req_tx_clone,
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "TCP connection pool task failed")
+                        {
+                            error!("{:#}", e);
+                        }
+                        // Use moved service_name_clone for debug log
+                        debug!(service = %service_name_clone, "TCP connection pool task finished.");
                     }
-                }
-                .instrument(Span::current()),
-            ),
-            ServiceType::Udp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_udp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
+                    // Use span-specific clone
+                    .instrument(info_span!("tcp_pool", service = %service_name_for_tcp_span)),
+                );
+            }
+            ServiceType::Udp => {
+                let shutdown_rx_clone = shutdown_tx.subscribe();
+                let bind_addr = service.bind_addr.clone();
+                let data_ch_req_tx_clone = data_ch_req_tx.clone(); // Clone sender for the pool task
+                tokio::spawn(
+                    async move {
+                        // Use moved service_name_clone inside a task
+                        if let Err(e) = run_udp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,           // data_ch_rx moved here
+                            data_ch_req_tx_clone, // Pass req channel
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "UDP connection pool task failed")
+                        {
+                            error!("{:#}", e);
+                        }
+                        // Use moved service_name_clone for debug log
+                        debug!(service = %service_name_clone, "UDP connection pool task finished.");
                     }
-                }
-                .instrument(Span::current()),
-            ),
+                    // Use span-specific clone
+                    .instrument(info_span!("udp_pool", service = %service_name_for_udp_span)),
+                );
+            }
         };
 
-        // Create the control channel
+        // Create the ControlChannel state struct
+        // (takes ownership of conn, shutdown_rx, data_ch_req_rx)
         let ch = ControlChannel::<T> {
             conn,
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
+            pool_size,
+            data_ch_req_tx: data_ch_req_tx.clone(),
         };
 
-        // Run the control channel
-        tokio::spawn(
-            async move {
-                if let Err(err) = ch.run().await {
-                    error!("{:#}", err);
-                }
-            }
-            .instrument(Span::current()),
-        );
-
-        ControlChannelHandle {
+        // Create the handle instance (returned to caller)
+        let handle = ControlChannelHandle {
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
-        }
+        };
+
+        // Create the Future that will execute the control channel logic
+        let control_task_future = async move { ch.run().await }.instrument(Span::current());
+
+        // Return the handle and the future
+        (handle, control_task_future)
     }
 }
 
-// Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
+// Control channel, using T as the transport layer.
 struct ControlChannel<T: Transport> {
-    conn: T::Stream,                               // The connection of control channel
-    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
-    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    conn: T::Stream,                        // The connection of control channel
+    shutdown_rx: broadcast::Receiver<bool>, // Receives the shutdown signal
+    data_ch_req_rx: mpsc::Receiver<bool>,   // Receives visitor connections (Bounded Receiver)
+    heartbeat_interval: u64,                // Application-layer heartbeat interval in secs
+    pool_size: usize,                       // Initial pool size to request
+    data_ch_req_tx: mpsc::Sender<bool>,     // Sender to request data channels (Bounded Sender)
 }
 
 impl<T: Transport> ControlChannel<T> {
@@ -506,10 +589,46 @@ impl<T: Transport> ControlChannel<T> {
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+        // Send Ack::Ok as the first action
+        match self
+            .write_and_flush(&bincode::serialize(&Ack::Ok)?)
+            .await
+        {
+            Ok(_) => {
+                info!("Control channel established and acknowledged.");
+            }
+            Err(e) => {
+                error!(
+                    "Failed to send Ack::Ok to client, closing control channel: {:#}",
+                    e
+                );
+                return Err(e);
+            }
+        }
 
-        // Wait for data channel requests and the shutdown signal
+        // Request initial data channels to fill the pool
+        debug!(
+            pool_size = self.pool_size,
+            "Sending initial data channel requests..."
+        );
+        for i in 0..self.pool_size {
+            if let Err(e) = self.data_ch_req_tx.send(true).await {
+                // If the receiver is dropped (channel closed), we can't proceed.
+                error!("Failed to send initial data channel request #{}/{}: {}, control channel closing", i + 1, self.pool_size, e);
+                return Err(anyhow!(
+                    "Data channel request queue closed unexpectedly during init: {}",
+                    e
+                ));
+            }
+        }
+        debug!(
+            "Sent initial {} data channel requests successfully.",
+            self.pool_size
+        );
+
+        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel)?;
+        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat)?;
+
         loop {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
@@ -531,7 +650,6 @@ impl<T: Transport> ControlChannel<T> {
                                 break;
                             }
                 }
-                // Wait for the shutdown signal
                 _ = self.shutdown_rx.recv() => {
                     break;
                 }
@@ -546,7 +664,7 @@ impl<T: Transport> ControlChannel<T> {
 
 fn tcp_listen_and_send(
     addr: String,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::Sender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> mpsc::Receiver<TcpStream> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
@@ -582,7 +700,7 @@ fn tcp_listen_and_send(
                 val = l.accept() => {
                     match val {
                         Err(e) => {
-                            // `l` is a TCP listener so this must be a IO error
+                            // `l` is a TCP listener, so this must be an IO error
                             // Possibly a EMFILE. So sleep for a while
                             error!("{}. Sleep for a while", e);
                             if let Some(d) = backoff.next_backoff() {
@@ -595,10 +713,10 @@ fn tcp_listen_and_send(
                         }
                         Ok((incoming, addr)) => {
                             // For every visitor, request to create a data channel
-                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                                // An error indicates the control channel is broken
-                                // So break the loop
-                                break;
+                            // Use .await and handle error for the bounded channel send
+                            if let Err(e) = data_ch_req_tx.send(true).await {
+                                error!("Failed to send data channel request (likely control channel closed): {}. Listener exiting.", e);
+                                break; // Exit the loop if send fails
                             }
 
                             backoff.reset();
@@ -626,11 +744,11 @@ fn tcp_listen_and_send(
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::Sender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp)?;
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
@@ -641,9 +759,12 @@ async fn run_tcp_connection_pool<T: Transport>(
                     });
                     break;
                 } else {
-                    // Current data channel is broken. Request for a new one
-                    if data_ch_req_tx.send(true).is_err() {
-                        break 'pool;
+                    // The Current data channel is broken.
+                    // Request for a new one
+                    // Use .await and handle error for the bounded channel send
+                    if let Err(e) = data_ch_req_tx.send(true).await {
+                        error!("Failed to send data channel request (likely control channel closed): {}. Pool exiting.", e);
+                        break 'pool; // Exit the outer loop if send fails
                     }
                 }
             } else {
@@ -660,7 +781,7 @@ async fn run_tcp_connection_pool<T: Transport>(
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    _data_ch_req_tx: mpsc::Sender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     // TODO: Load balance
@@ -678,7 +799,7 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp)?;
 
     // Receive one data channel
     let mut conn = data_ch_rx

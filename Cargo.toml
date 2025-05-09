@@ -1,6 +1,6 @@
 [package]
 name = "rathole"
-version = "0.5.0"
+version = "0.5.2"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>"]
 description = "A reverse proxy for NAT traversal"
@@ -13,10 +13,10 @@ include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
 [features]
 default = [
     "server",
-    "client",
-    "native-tls",
+    # "client",
+    # "native-tls",
     "noise",
-    "websocket-native-tls",
+    # "websocket-native-tls",
     "hot-reload",
 ]
 

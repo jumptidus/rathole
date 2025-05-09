@@ -302,7 +302,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     server_config: Arc<ServerConfig>,
     timestamp: u64,
 ) -> Result<()> {
-    info!("Try to handshake a control channel");
+    info!("尝试建立控制通道，客户端时间戳: {}", timestamp);
 
     T::hint(&conn, SocketOpts::for_control_channel());
 
@@ -330,7 +330,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         None => {
             conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
                 .await?;
-            bail!("No such a service {}", hex::encode(service_digest));
+            bail!("无此服务 {}", hex::encode(service_digest));
         }
     }
     .to_owned();
@@ -350,17 +350,48 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
         debug!(
-            "Expect {}, but got {}",
+            "认证失败. 期望 {}, 实际 {}",
             hex::encode(session_key),
             hex::encode(d)
         );
-        bail!("Service {} failed the authentication", service_name);
+        bail!("服务 {} 认证失败", service_name);
     } else {
+        // 检查是否已存在相同服务的通道，并比较时间戳
+        let existing_channel = {
+            let control_map_guard = control_channels.read().await;
+            if let Some(existing) = control_map_guard.get1(&service_digest) {
+                // 如果现有通道时间戳更大，拒绝新连接
+                if existing.timestamp > timestamp {
+                    info!(
+                        service = %service_name,
+                        existing_ts = existing.timestamp,
+                        new_ts = timestamp,
+                        "拒绝连接：现有通道时间戳更新"
+                    );
+                    conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
+                        .await?;
+                    return Ok(());
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        if existing_channel {
+            info!(
+                service = %service_name,
+                new_ts = timestamp,
+                "发现时间戳更新的连接，将替换现有通道"
+            );
+        }
+
         // 1. Prepare Handle and Control Task Future
         let (handle, control_task_future) = ControlChannelHandle::prepare(
             conn,
             service_config.clone(),
             server_config.heartbeat_interval,
+            timestamp,
         );
 
         let nonce_for_cleanup = session_key;
@@ -370,27 +401,34 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         {
             let mut control_map_guard = control_channels.write().await;
 
-            // Optional: Check for existing nonce/service_digest and handle collision/stale entry
-            // Use getX().is_some() and explicitly remove before insert.
-            if control_map_guard.get2(&nonce_for_cleanup).is_some() {
-                warn!(
-                    service = %service_name, nonce = %hex::encode(nonce_for_cleanup),
-                    "Nonce collision or potentially stale entry detected during insertion. Removing old entry before inserting."
+            // 基于时间戳的替换逻辑
+            if let Some(existing) = control_map_guard.get1(&service_digest) {
+                info!(
+                    service = %service_name,
+                    old_ts = existing.timestamp,
+                    new_ts = timestamp,
+                    nonce = %hex::encode(nonce_for_cleanup),
+                    "替换旧通道，使用更新的时间戳"
                 );
-                // Explicitly remove the entry associated with the colliding nonce
-                let _ = control_map_guard.remove2(&nonce_for_cleanup);
-            } else if control_map_guard.get1(&service_digest).is_some() {
-                warn!(
-                   service = %service_name,
-                   "Existing control channel found for service digest during insertion. Removing old entry before inserting."
-                );
-                // Explicitly remove the entry associated with the colliding service digest
+                // 移除旧通道
                 let _ = control_map_guard.remove1(&service_digest);
+            } else if control_map_guard.get2(&nonce_for_cleanup).is_some() {
+                warn!(
+                    service = %service_name,
+                    nonce = %hex::encode(nonce_for_cleanup),
+                    "发现潜在的会话密钥冲突，移除旧条目"
+                );
+                let _ = control_map_guard.remove2(&nonce_for_cleanup);
             }
 
             // Insert the new handle. `handle` is moved into the map.
             let _ = control_map_guard.insert(service_digest, nonce_for_cleanup, handle);
-            info!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "Control channel handle inserted.");
+            info!(
+                service = %service_name,
+                nonce = %hex::encode(nonce_for_cleanup),
+                timestamp = timestamp,
+                "控制通道句柄已插入"
+            );
         }
 
         // Clone names again for the spans, as the original is moved into the tasks
@@ -404,9 +442,9 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                 // owns the connection and runs `ControlChannel::run`
                 if let Err(err) = control_task_future.await {
                     // Use moved variables inside the task
-                    error!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "Control channel task failed: {:#}", err);
+                    error!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "控制通道任务失败: {:#}", err);
                 } else {
-                    debug!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "Control channel task finished successfully.");
+                    debug!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "控制通道任务成功完成");
                 }
             }
             // Instrument the task - Use the newly cloned variables for the span
@@ -423,24 +461,24 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                 match control_task_handle.await {
                     Ok(_) => {
                         // Use moved nonce inside
-                        debug!(nonce = %hex::encode(nonce_for_cleanup), "Control task joined. Proceeding with cleanup.");
+                        debug!(nonce = %hex::encode(nonce_for_cleanup), "控制任务已结束，准备清理");
                     },
                     Err(e) => {
                         // Use moved nonce inside
-                        error!(nonce = %hex::encode(nonce_for_cleanup), "Control task join failed (panicked or cancelled): {}. Attempting cleanup.", e);
+                        error!(nonce = %hex::encode(nonce_for_cleanup), "控制任务加入失败(异常或取消): {}，尝试清理", e);
                     }
                 }
 
                 if let Some(map_arc) = control_channels_weak.upgrade() {
-                    debug!(nonce = %hex::encode(nonce_for_cleanup), "Acquiring lock for cleanup.");
+                    debug!(nonce = %hex::encode(nonce_for_cleanup), "获取锁准备清理");
                     let mut map_guard = map_arc.write().await;
                     if let Some(_removed_handle) = map_guard.remove2(&nonce_for_cleanup) {
-                        info!(nonce = %hex::encode(nonce_for_cleanup), "Control channel handle removed successfully.");
+                        info!(nonce = %hex::encode(nonce_for_cleanup), "控制通道句柄成功移除");
                     } else {
-                        warn!(nonce = %hex::encode(nonce_for_cleanup), "Control channel handle already removed before cleanup task ran.");
+                        warn!(nonce = %hex::encode(nonce_for_cleanup), "清理任务执行前控制通道句柄已被移除");
                     }
                 } else {
-                    warn!(nonce = %hex::encode(nonce_for_cleanup), "Control channel map was dropped before cleanup could run.");
+                    warn!(nonce = %hex::encode(nonce_for_cleanup), "清理执行前控制通道映射已被释放");
                 }
             }
             // Instrument the cleanup task - Use the span-specific cloned nonce
@@ -483,6 +521,8 @@ pub struct ControlChannelHandle<T: Transport> {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
+    // 添加时间戳字段，记录连接建立时间
+    timestamp: u64,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -496,6 +536,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        timestamp: u64,
     ) -> (Self, impl Future<Output = Result<()>> + Send + 'static) {
         // Create shutdown channel, data channel queue, request channel (Bounded now)
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -584,6 +625,7 @@ where
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
+            timestamp,
         };
 
         // Create the Future that will execute the control channel logic

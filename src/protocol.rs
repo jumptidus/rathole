@@ -31,6 +31,7 @@ pub enum Ack {
     Ok,
     ServiceNotExist,
     AuthFailed,
+    RejectedDueToTimestamp,
 }
 
 impl std::fmt::Display for Ack {
@@ -42,6 +43,7 @@ impl std::fmt::Display for Ack {
                 Ack::Ok => "Ok",
                 Ack::ServiceNotExist => "Service not exist",
                 Ack::AuthFailed => "Incorrect token",
+                Ack::RejectedDueToTimestamp => "Rejected due to older timestamp",
             }
         )
     }
@@ -158,8 +160,19 @@ impl PacketLength {
         let c_cmd =
             bincode::serialized_size(&ControlChannelCmd::CreateDataChannel).unwrap() as usize;
         let d_cmd = bincode::serialized_size(&DataChannelCmd::StartForwardTcp).unwrap() as usize;
-        let ack = Ack::Ok;
-        let ack = bincode::serialized_size(&ack).unwrap() as usize;
+
+        // 计算所有Ack变体中的最大长度
+        let ack_variants = [
+            Ack::Ok,
+            Ack::ServiceNotExist,
+            Ack::AuthFailed,
+            Ack::RejectedDueToTimestamp,
+        ];
+        let ack = ack_variants
+            .iter()
+            .map(|a| bincode::serialized_size(a).unwrap() as usize)
+            .max()
+            .unwrap();
 
         let auth = bincode::serialized_size(&Auth(d)).unwrap() as usize;
         PacketLength {

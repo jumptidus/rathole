@@ -42,9 +42,8 @@ async fn run_server() -> Result<()> {
 
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
 
-    run_rathole_server("tests/for_udp/tcp_transport.toml", server_shutdown_rx)
-        .await?;
-    
+    run_rathole_server("tests/for_udp/tcp_transport.toml", server_shutdown_rx).await?;
+
     Ok(())
 }
 

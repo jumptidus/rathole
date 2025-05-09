@@ -6,7 +6,7 @@ use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, UdpTraffic,
-    HASH_WIDTH_IN_BYTES,
+    HASH_WIDTH_IN_BYTES, PROTO_V2,
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
@@ -257,14 +257,33 @@ async fn handle_connection<T: 'static + Transport>(
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
+
     match hello {
-        ControlChannelHello(_, service_digest) => {
+        ControlChannelHello(protocol_version, service_digest) => {
+            let mut timestamp = 0;
+            if protocol_version == PROTO_V2 {
+                // 从conn中读取一个u64的时间戳,如果没有则设置为 0
+                timestamp = match conn.read_u64_le().await {
+                    Ok(ts) => {
+                        debug!("成功读取时间戳: {}", ts);
+                        ts
+                    }
+                    Err(e) => {
+                        // 如果是EOF或连接关闭，这很可能意味着没有时间戳
+                        debug!("无法读取时间戳，可能是旧版本客户端: {}", e);
+                        0
+                    }
+                };
+            }
+            info!("客户端时间戳: {}", timestamp);
+
             do_control_channel_handshake(
                 conn,
                 services,
                 control_channels,
                 service_digest,
                 server_config,
+                timestamp,
             )
             .await?;
         }
@@ -281,6 +300,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
+    timestamp: u64,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -292,7 +312,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     // Send hello
     let hello_send = ControlChannelHello(
-        protocol::CURRENT_PROTO_VERSION,
+        // 如果timestamp为0，则使用当前协议版本，否则使用v2
+        if timestamp == 0 {
+            protocol::CURRENT_PROTO_VERSION
+        } else {
+            protocol::PROTO_V2
+        },
         nonce.clone().try_into().unwrap(),
     );
     conn.write_all(&bincode::serialize(&hello_send).unwrap())
@@ -590,10 +615,7 @@ impl<T: Transport> ControlChannel<T> {
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
         // Send Ack::Ok as the first action
-        match self
-            .write_and_flush(&bincode::serialize(&Ack::Ok)?)
-            .await
-        {
+        match self.write_and_flush(&bincode::serialize(&Ack::Ok)?).await {
             Ok(_) => {
                 info!("Control channel established and acknowledged.");
             }

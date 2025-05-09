@@ -11,6 +11,7 @@ use tracing::trace;
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
 const PROTO_V1: u8 = 1u8;
+pub const PROTO_V2: u8 = 2u8;
 
 pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
 
@@ -184,7 +185,8 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
 
     match hello {
         Hello::ControlChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
+            // 服务端兼容v2和v1
+            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 {
                 bail!(
                     "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
                     CURRENT_PROTO_VERSION,
@@ -193,7 +195,8 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
             }
         }
         Hello::DataChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
+            // 服务端兼容v2和v1
+            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 {
                 bail!(
                     "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
                     CURRENT_PROTO_VERSION,

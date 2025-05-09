@@ -28,12 +28,26 @@ enum Type {
 }
 
 fn init() {
-    let level = "info";
+    let level = "debug";
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)),
         )
         .try_init();
+}
+
+#[tokio::test]
+async fn run_client() -> Result<()> {
+    init();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+
+    
+    run_rathole_client("tests/for_udp/tcp_transport.toml", client_shutdown_rx)
+        .await
+        .unwrap(); 
+    
+    Ok(())
 }
 
 #[tokio::test]

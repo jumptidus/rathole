@@ -10,9 +10,10 @@ use tracing::trace;
 
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
-const PROTO_V1: u8 = 1u8;
+const _PROTO_V1: u8 = 1u8;
+pub const PROTO_V2: u8 = 2u8;
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V2;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 

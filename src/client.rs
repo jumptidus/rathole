@@ -4,7 +4,7 @@ use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
-    DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
+    DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES, PROTO_V2,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
@@ -35,6 +35,7 @@ pub async fn run_client(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
+    timestamp: u64,
 ) -> Result<()> {
     let config = config.client.ok_or_else(|| {
         anyhow!(
@@ -45,7 +46,7 @@ pub async fn run_client(
     match config.transport.transport_type {
         TransportType::Tcp => {
             let mut client = Client::<TcpTransport>::from(config).await?;
-            client.run(shutdown_rx, update_rx).await
+            client.run(shutdown_rx, update_rx, timestamp).await
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
@@ -60,7 +61,7 @@ pub async fn run_client(
             #[cfg(feature = "noise")]
             {
                 let mut client = Client::<NoiseTransport>::from(config).await?;
-                client.run(shutdown_rx, update_rx).await
+                client.run(shutdown_rx, update_rx, timestamp).await
             }
             #[cfg(not(feature = "noise"))]
             crate::helper::feature_not_compile("noise")
@@ -104,6 +105,7 @@ impl<T: 'static + Transport> Client<T> {
         &mut self,
         mut shutdown_rx: broadcast::Receiver<bool>,
         mut update_rx: mpsc::Receiver<ConfigChange>,
+        timestamp: u64,
     ) -> Result<()> {
         for (name, config) in &self.config.services {
             // Create a control channel for each service defined
@@ -112,6 +114,7 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
+                timestamp,
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -130,7 +133,7 @@ impl<T: 'static + Transport> Client<T> {
                 },
                 e = update_rx.recv() => {
                     if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
+                        self.handle_hot_reload(e, timestamp).await;
                     }
                 }
             }
@@ -144,7 +147,7 @@ impl<T: 'static + Transport> Client<T> {
         Ok(())
     }
 
-    async fn handle_hot_reload(&mut self, e: ConfigChange) {
+    async fn handle_hot_reload(&mut self, e: ConfigChange, timestamp: u64) {
         match e {
             ConfigChange::ClientChange(client_change) => match client_change {
                 ClientServiceChange::Add(cfg) => {
@@ -154,6 +157,7 @@ impl<T: 'static + Transport> Client<T> {
                         self.config.remote_addr.clone(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
+                        timestamp,
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
@@ -402,7 +406,7 @@ struct ControlChannelHandle {
 
 impl<T: 'static + Transport> ControlChannel<T> {
     #[instrument(skip_all)]
-    async fn run(&mut self) -> Result<()> {
+    async fn run(&mut self, timestamp: u64) -> Result<()> {
         let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
         remote_addr.resolve().await?;
 
@@ -419,6 +423,13 @@ impl<T: 'static + Transport> ControlChannel<T> {
             Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest[..].try_into().unwrap());
         conn.write_all(&bincode::serialize(&hello_send).unwrap())
             .await?;
+
+        // 0.5.1版本 增加发送 timestamp
+        if CURRENT_PROTO_VERSION == PROTO_V2 {
+            conn.write_all(&timestamp.to_le_bytes()).await?;
+            debug!("timestamp: {}", timestamp);
+        }
+
         conn.flush().await?;
 
         // Read hello
@@ -501,6 +512,7 @@ impl ControlChannelHandle {
         remote_addr: String,
         transport: Arc<T>,
         heartbeat_timeout: u64,
+        timestamp: u64,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
@@ -523,7 +535,7 @@ impl ControlChannelHandle {
                 let mut start = Instant::now();
 
                 while let Err(err) = s
-                    .run()
+                    .run(timestamp)
                     .await
                     .with_context(|| "Failed to run the control channel")
                 {

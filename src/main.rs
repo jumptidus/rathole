@@ -8,6 +8,8 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
+    let timestamp = tokio::time::Instant::now().elapsed().as_millis() as u64;
+
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
     tokio::spawn(async move {
         if let Err(e) = signal::ctrl_c().await {
@@ -41,5 +43,5 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    run(args, shutdown_rx).await
+    run(args, shutdown_rx, timestamp).await
 }

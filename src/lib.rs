@@ -59,7 +59,7 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
     crate::helper::feature_not_compile("nosie")
 }
 
-pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>, timestamp: u64) -> Result<()> {
     if args.genkey.is_some() {
         return genkey(args.genkey.unwrap());
     }
@@ -96,6 +96,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                         args.clone(),
                         shutdown_tx.subscribe(),
                         service_update_rx,
+                        timestamp,
                     )),
                     service_update_tx,
                 ));
@@ -119,6 +120,7 @@ async fn run_instance(
     args: Cli,
     shutdown_rx: broadcast::Receiver<bool>,
     service_update: mpsc::Receiver<ConfigChange>,
+    timestamp: u64,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
@@ -126,7 +128,7 @@ async fn run_instance(
             #[cfg(not(feature = "client"))]
             crate::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
-            run_client(config, shutdown_rx, service_update).await
+            run_client(config, shutdown_rx, service_update, timestamp).await
         }
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
@@ -161,7 +163,11 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
     }
 }
 
-pub async fn run_from_str(config_str: &str, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+pub async fn run_from_str(
+    config_str: &str,
+    shutdown_rx: broadcast::Receiver<bool>,
+    timestamp: u64,
+) -> Result<()> {
     let config = Config::from_str(config_str)?;
 
     let args = Cli {
@@ -173,7 +179,7 @@ pub async fn run_from_str(config_str: &str, shutdown_rx: broadcast::Receiver<boo
 
     let (_service_update_tx, service_update_rx) = mpsc::channel(1024);
 
-    run_instance(config, args, shutdown_rx, service_update_rx).await
+    run_instance(config, args, shutdown_rx, service_update_rx, timestamp).await
 }
 
 #[cfg(test)]

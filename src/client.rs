@@ -519,7 +519,7 @@ impl ControlChannelHandle {
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
+        let mut retry_backoff = run_control_chan_backoff(60); // 最大 60s
 
         let mut s = ControlChannel {
             digest,

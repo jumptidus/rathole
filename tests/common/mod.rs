@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use tokio::{
@@ -6,6 +9,7 @@ use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::broadcast,
 };
+use tracing::info;
 
 pub const PING: &str = "ping";
 pub const PONG: &str = "pong";
@@ -20,7 +24,8 @@ pub async fn run_rathole_server(
         client: false,
         ..Default::default()
     };
-    rathole::run(cli, shutdown_rx).await
+    let timestamp = tokio::time::Instant::now().elapsed().as_millis() as u64;
+    rathole::run(cli, shutdown_rx, timestamp).await
 }
 
 pub async fn run_rathole_client(
@@ -33,7 +38,12 @@ pub async fn run_rathole_client(
         client: true,
         ..Default::default()
     };
-    rathole::run(cli, shutdown_rx).await
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    info!("init timestamp: {}", timestamp);
+    rathole::run(cli, shutdown_rx, timestamp).await
 }
 
 pub mod tcp {

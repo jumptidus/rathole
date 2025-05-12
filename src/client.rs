@@ -543,8 +543,8 @@ impl ControlChannelHandle {
                         break;
                     }
 
-                    if start.elapsed() > Duration::from_secs(3) {
-                        // The client runs for at least 3 secs and then disconnects
+                    if start.elapsed() > Duration::from_secs(10) {
+                        // The client runs for at least 10 secs and then disconnects
                         retry_backoff.reset();
                     }
 

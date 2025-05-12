@@ -42,11 +42,10 @@ async fn run_client() -> Result<()> {
 
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
 
-    
     run_rathole_client("tests/for_udp/tcp_transport.toml", client_shutdown_rx)
         .await
-        .unwrap(); 
-    
+        .unwrap();
+
     Ok(())
 }
 

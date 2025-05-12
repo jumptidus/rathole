@@ -13,7 +13,7 @@ VERSION=$(grep '^version = ' Cargo.toml | cut -d '"' -f2)
 
 # 设置输出目录
 CURRENT_DATE=$(date +"%Y%m%d")
-OUTPUT_DIR="release_builds_${CURRENT_DATE}_v${VERSION}"
+OUTPUT_DIR="server_${CURRENT_DATE}_v${VERSION}"
 mkdir -p $OUTPUT_DIR
 
 # 安装必要的工具
@@ -40,7 +40,7 @@ do
         echo "编译成功,正在复制文件..."
         TARGET_DIR="$OUTPUT_DIR/$TARGET"
         mkdir -p $TARGET_DIR
-        cp target/$TARGET/release/jy $TARGET_DIR/
+        cp target/$TARGET/release/rathole $TARGET_DIR/
         echo "已复制 文件 到 $TARGET_DIR"
     else
         echo "编译 $TARGET 失败"

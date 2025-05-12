@@ -16,6 +16,7 @@ use backoff::ExponentialBackoff;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
@@ -190,7 +191,7 @@ impl<T: 'static + Transport> Server<T> {
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, addr).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -254,6 +255,7 @@ async fn handle_connection<T: 'static + Transport>(
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
+    addr: SocketAddr,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
@@ -261,21 +263,23 @@ async fn handle_connection<T: 'static + Transport>(
     match hello {
         ControlChannelHello(protocol_version, service_digest) => {
             let mut timestamp = 0;
+
+            // if version is v2, read timestamp from conn
             if protocol_version == PROTO_V2 {
-                // 从conn中读取一个u64的时间戳,如果没有则设置为 0
+                // read a u64 timestamp from conn, if not, default set to 0
                 timestamp = match conn.read_u64_le().await {
                     Ok(ts) => {
-                        debug!("成功读取时间戳: {}", ts);
+                        debug!("read ts from conn success: {}", ts);
                         ts
                     }
                     Err(e) => {
-                        // 如果是EOF或连接关闭，这很可能意味着没有时间戳
-                        debug!("无法读取时间戳，可能是旧版本客户端: {}", e);
+                        // if EOF or connection closed, it means no timestamp
+                        debug!("failed to read timestamp, maybe old version client: {}", e);
                         0
                     }
                 };
             }
-            info!("客户端时间戳: {}", timestamp);
+            info!("client timestamp: {}", timestamp);
 
             do_control_channel_handshake(
                 conn,
@@ -284,6 +288,7 @@ async fn handle_connection<T: 'static + Transport>(
                 service_digest,
                 server_config,
                 timestamp,
+                addr,
             )
             .await?;
         }
@@ -301,8 +306,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
     timestamp: u64,
+    addr: SocketAddr,
 ) -> Result<()> {
-    info!("尝试建立控制通道，客户端时间戳: {}", timestamp);
+    info!(
+        "try to establish control channel, client timestamp: {}, addr: {}",
+        timestamp, addr
+    );
 
     T::hint(&conn, SocketOpts::for_control_channel());
 
@@ -312,7 +321,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     // Send hello
     let hello_send = ControlChannelHello(
-        // 如果timestamp为0，则使用当前协议版本，否则使用v2
+        // if timestamp is 0, use current protocol version, otherwise use v2
         if timestamp == 0 {
             protocol::CURRENT_PROTO_VERSION
         } else {
@@ -320,6 +329,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         },
         nonce.clone().try_into().unwrap(),
     );
+
     conn.write_all(&bincode::serialize(&hello_send).unwrap())
         .await?;
     conn.flush().await?;
@@ -330,7 +340,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         None => {
             conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
                 .await?;
-            bail!("无此服务 {}", hex::encode(service_digest));
+            bail!("not found service: {}", hex::encode(service_digest));
         }
     }
     .to_owned();
@@ -350,28 +360,47 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
         debug!(
-            "认证失败. 期望 {}, 实际 {}",
+            "auth failed, expect {}, actual {}",
             hex::encode(session_key),
             hex::encode(d)
         );
-        bail!("服务 {} 认证失败", service_name);
+        bail!("service {} auth failed", service_name);
     } else {
-        // 检查是否已存在相同服务的通道，并比较时间戳
+        // check if there is an existing channel with the same service, and compare timestamps
         let existing_channel = {
             let control_map_guard = control_channels.read().await;
             if let Some(existing) = control_map_guard.get1(&service_digest) {
-                // 如果现有通道时间戳更大，拒绝新连接
-                if existing.timestamp > timestamp {
+                // if existing channel timestamp is greater than new timestamp, reject new connection
+                info!(
+                    service = %service_name,
+                    old_ts = existing.timestamp,
+                    old_addr = %existing.addr,
+                    new_ts = timestamp,
+                    new_addr = %addr,
+                    "found existing channel"
+                );
+                if existing.timestamp >= timestamp {
                     info!(
                         service = %service_name,
-                        existing_ts = existing.timestamp,
+                        old_ts = existing.timestamp,
+                        old_addr = %existing.addr,
                         new_ts = timestamp,
-                        "拒绝连接：现有通道时间戳更新"
+                        new_addr = %addr,
+                        "reject connection: old_ts:{} >= new_ts:{}",
+                        existing.timestamp, timestamp
                     );
                     conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
                         .await?;
                     return Ok(());
                 }
+                info!(
+                    service = %service_name,
+                    old_ts = existing.timestamp,
+                    old_addr = %existing.addr,
+                    new_ts = timestamp,
+                    new_addr = %addr,
+                    "replace existing channel"
+                );
                 true
             } else {
                 false
@@ -382,7 +411,8 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             info!(
                 service = %service_name,
                 new_ts = timestamp,
-                "发现时间戳更新的连接，将替换现有通道"
+                new_addr = %addr,
+                "create or replace control channel"
             );
         }
 
@@ -392,6 +422,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             service_config.clone(),
             server_config.heartbeat_interval,
             timestamp,
+            addr,
         );
 
         let nonce_for_cleanup = session_key;
@@ -401,22 +432,22 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         {
             let mut control_map_guard = control_channels.write().await;
 
-            // 基于时间戳的替换逻辑
             if let Some(existing) = control_map_guard.get1(&service_digest) {
                 info!(
                     service = %service_name,
                     old_ts = existing.timestamp,
                     new_ts = timestamp,
+                    old_addr = %existing.addr,
+                    new_addr = %addr,
                     nonce = %hex::encode(nonce_for_cleanup),
-                    "替换旧通道，使用更新的时间戳"
+                    "replace old channel, create new control channel"
                 );
-                // 移除旧通道
                 let _ = control_map_guard.remove1(&service_digest);
             } else if control_map_guard.get2(&nonce_for_cleanup).is_some() {
                 warn!(
                     service = %service_name,
                     nonce = %hex::encode(nonce_for_cleanup),
-                    "发现潜在的会话密钥冲突，移除旧条目"
+                    "potential session key conflict detected, remove old entry"
                 );
                 let _ = control_map_guard.remove2(&nonce_for_cleanup);
             }
@@ -426,8 +457,9 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             info!(
                 service = %service_name,
                 nonce = %hex::encode(nonce_for_cleanup),
-                timestamp = timestamp,
-                "控制通道句柄已插入"
+                ts = timestamp,
+                addr = %addr,
+                "control channel handle inserted"
             );
         }
 
@@ -442,9 +474,9 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                 // owns the connection and runs `ControlChannel::run`
                 if let Err(err) = control_task_future.await {
                     // Use moved variables inside the task
-                    error!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "控制通道任务失败: {:#}", err);
+                    error!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "control channel task failed: {:#}", err);
                 } else {
-                    debug!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "控制通道任务成功完成");
+                    debug!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "control channel task completed successfully");
                 }
             }
             // Instrument the task - Use the newly cloned variables for the span
@@ -461,24 +493,24 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                 match control_task_handle.await {
                     Ok(_) => {
                         // Use moved nonce inside
-                        debug!(nonce = %hex::encode(nonce_for_cleanup), "控制任务已结束，准备清理");
+                        debug!(nonce = %hex::encode(nonce_for_cleanup), "control task completed, prepare to cleanup");
                     },
                     Err(e) => {
                         // Use moved nonce inside
-                        error!(nonce = %hex::encode(nonce_for_cleanup), "控制任务加入失败(异常或取消): {}，尝试清理", e);
+                        error!(nonce = %hex::encode(nonce_for_cleanup), "control task failed, prepare to cleanup: {}", e);
                     }
                 }
 
                 if let Some(map_arc) = control_channels_weak.upgrade() {
-                    debug!(nonce = %hex::encode(nonce_for_cleanup), "获取锁准备清理");
+                    debug!(nonce = %hex::encode(nonce_for_cleanup), "get lock, prepare to cleanup");
                     let mut map_guard = map_arc.write().await;
                     if let Some(_removed_handle) = map_guard.remove2(&nonce_for_cleanup) {
-                        info!(nonce = %hex::encode(nonce_for_cleanup), "控制通道句柄成功移除");
+                        info!(nonce = %hex::encode(nonce_for_cleanup), "control channel handle removed successfully");
                     } else {
-                        warn!(nonce = %hex::encode(nonce_for_cleanup), "清理任务执行前控制通道句柄已被移除");
+                        warn!(nonce = %hex::encode(nonce_for_cleanup), "control channel handle removed before cleanup");
                     }
                 } else {
-                    warn!(nonce = %hex::encode(nonce_for_cleanup), "清理执行前控制通道映射已被释放");
+                    warn!(nonce = %hex::encode(nonce_for_cleanup), "control channel map released before cleanup");
                 }
             }
             // Instrument the cleanup task - Use the span-specific cloned nonce
@@ -523,6 +555,7 @@ pub struct ControlChannelHandle<T: Transport> {
     service: ServerServiceConfig,
     // 添加时间戳字段，记录连接建立时间
     timestamp: u64,
+    addr: SocketAddr,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -537,6 +570,7 @@ where
         service: ServerServiceConfig,
         heartbeat_interval: u64,
         timestamp: u64,
+        addr: SocketAddr,
     ) -> (Self, impl Future<Output = Result<()>> + Send + 'static) {
         // Create shutdown channel, data channel queue, request channel (Bounded now)
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -626,6 +660,7 @@ where
             data_ch_tx,
             service,
             timestamp,
+            addr,
         };
 
         // Create the Future that will execute the control channel logic

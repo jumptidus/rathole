@@ -8,11 +8,16 @@ use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, UdpTraffic,
     HASH_WIDTH_IN_BYTES, PROTO_V2,
 };
+#[cfg(feature = "noise")]
+use crate::transport::NoiseTransport;
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+use crate::transport::TlsTransport;
+#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+use crate::transport::WebsocketTransport;
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
-
 use rand::RngCore;
 use std::collections::HashMap;
 use std::future::Future;
@@ -22,15 +27,8 @@ use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio::time;
+use tokio::time::{self, timeout, Instant};
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
-
-#[cfg(feature = "noise")]
-use crate::transport::NoiseTransport;
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-use crate::transport::TlsTransport;
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-use crate::transport::WebsocketTransport;
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
@@ -880,11 +878,14 @@ async fn run_tcp_connection_pool<T: Transport>(
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    _data_ch_req_tx: mpsc::Sender<bool>,
+    data_ch_req_tx: mpsc::Sender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    // TODO: Load balance
+    const UDP_READ_TIMEOUT: Duration = Duration::from_secs(10); // UDP Read Timeout
+    const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10); // UDP Write Timeout
+    const UDP_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(300); // 5分钟
 
+    // 绑定UDP监听socket
     let l = retry_notify_with_deadline(
         listen_backoff(),
         || async { Ok(UdpSocket::bind(&bind_addr).await?) },
@@ -899,36 +900,155 @@ async fn run_udp_connection_pool<T: Transport>(
     info!("Listening at {}", &bind_addr);
 
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp)?;
-
-    // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
-
     let mut buf = [0u8; UDP_BUFFER_SIZE];
-    loop {
-        tokio::select! {
-            // Forward inbound traffic to the client
-            val = l.recv_from(&mut buf) => {
-                let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
-            },
+    let mut last_activity = Instant::now();
 
-            // Forward outbound traffic from the client to the visitor
-            hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
-                l.send_to(&t.data, t.from).await?;
+    // 主循环：管理连接和数据转发
+    'main_loop: loop {
+        // 获取或重建数据通道连接
+        let mut conn = match data_ch_rx.recv().await {
+            Some(mut c) => {
+                match timeout(UDP_WRITE_TIMEOUT, write_and_flush(&mut c, &cmd)).await {
+                    Ok(Ok(_)) => {
+                        debug!("UDP connection established");
+                        c
+                    }
+                    Ok(Err(e)) => {
+                        error!("Failed to send start command: {}", e);
+                        // 请求新连接
+                        if let Err(e) = data_ch_req_tx.send(true).await {
+                            error!("Failed to request new data channel: {}", e);
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        error!("Timeout sending start command");
+                        // 请求新连接
+                        if let Err(e) = data_ch_req_tx.send(true).await {
+                            error!("Failed to request new data channel: {}", e);
+                            break;
+                        }
+                        continue;
+                    }
+                }
             }
-
-            _ = shutdown_rx.recv() => {
+            None => {
+                error!("Data channel receiver closed");
                 break;
+            }
+        };
+
+        // 数据转发循环
+        'data_loop: loop {
+            tokio::select! {
+                // 处理从UDP socket来的数据 (inbound)
+                result = timeout(UDP_READ_TIMEOUT, l.recv_from(&mut buf)) => {
+                    match result {
+                        Ok(Ok((n, from))) => {
+                            last_activity = Instant::now();
+                            match timeout(UDP_WRITE_TIMEOUT, UdpTraffic::write_slice(&mut conn, from, &buf[..n])).await {
+                                Ok(Ok(_)) => {},
+                                Ok(Err(e)) => {
+                                    error!("Failed to write UDP traffic to client: {}", e);
+                                    // 连接失败，重建
+                                    if let Err(e) = data_ch_req_tx.send(true).await {
+                                        error!("Failed to request new data channel: {}", e);
+                                        break 'main_loop;
+                                    }
+                                    break 'data_loop;
+                                },
+                                Err(_) => {
+                                    error!("Timeout writing UDP traffic to client");
+                                    // 连接失败，重建
+                                    if let Err(e) = data_ch_req_tx.send(true).await {
+                                        error!("Failed to request new data channel: {}", e);
+                                        break 'main_loop;
+                                    }
+                                    break 'data_loop;
+                                }
+                            }
+                        },
+                        Ok(Err(e)) => {
+                            error!("UDP socket recv_from error: {}", e);
+                        },
+                        Err(_) => {
+                            // 读取超时，检查整体活动超时
+                            if last_activity.elapsed() > UDP_ACTIVITY_TIMEOUT {
+                                warn!("UDP connection inactive for too long, reconnecting...");
+                                if let Err(e) = data_ch_req_tx.send(true).await {
+                                    error!("Failed to request new data channel: {}", e);
+                                    break 'main_loop;
+                                }
+                                break 'data_loop;
+                            }
+                        }
+                    }
+                },
+
+                // 处理从客户端来的数据 (outbound)
+                result = timeout(UDP_READ_TIMEOUT, conn.read_u8()) => {
+                    match result {
+                        Ok(Ok(hdr_len)) => {
+                            match timeout(UDP_READ_TIMEOUT, UdpTraffic::read(&mut conn, hdr_len)).await {
+                                Ok(Ok(traffic)) => {
+                                    last_activity = Instant::now();
+                                    if let Err(e) = l.send_to(&traffic.data, traffic.from).await {
+                                        error!("Failed to send UDP data to visitor: {}", e);
+                                    }
+                                },
+                                Ok(Err(e)) => {
+                                    error!("Failed to read UDP traffic from client: {}", e);
+                                    // 连接失败，重建
+                                    if let Err(e) = data_ch_req_tx.send(true).await {
+                                        error!("Failed to request new data channel: {}", e);
+                                        break 'main_loop;
+                                    }
+                                    break 'data_loop;
+                                },
+                                Err(_) => {
+                                    error!("Timeout reading UDP traffic from client");
+                                    // 连接失败，重建
+                                    if let Err(e) = data_ch_req_tx.send(true).await {
+                                        error!("Failed to request new data channel: {}", e);
+                                        break 'main_loop;
+                                    }
+                                    break 'data_loop;
+                                }
+                            }
+                        },
+                        Ok(Err(e)) => {
+                            error!("UDP connection read error: {}", e);
+                            // 连接失败，重建
+                            if let Err(e) = data_ch_req_tx.send(true).await {
+                                error!("Failed to request new data channel: {}", e);
+                                break 'main_loop;
+                            }
+                            break 'data_loop;
+                        },
+                        Err(_) => {
+                            // 读取超时，检查整体活动超时
+                            if last_activity.elapsed() > UDP_ACTIVITY_TIMEOUT {
+                                warn!("UDP connection inactive for too long, reconnecting...");
+                                if let Err(e) = data_ch_req_tx.send(true).await {
+                                    error!("Failed to request new data channel: {}", e);
+                                    break 'main_loop;
+                                }
+                                break 'data_loop;
+                            }
+                        }
+                    }
+                },
+
+                // 处理关闭信号
+                _ = shutdown_rx.recv() => {
+                    debug!("UDP pool shutdown signal received");
+                    break 'main_loop;
+                }
             }
         }
     }
 
     debug!("UDP pool dropped");
-
     Ok(())
 }

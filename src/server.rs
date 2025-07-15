@@ -33,7 +33,7 @@ use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span}
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
-const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
+const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP services
 const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const DATA_CHANNEL_REQUEST_BUFFER: usize = CHAN_SIZE / 2; // Buffer for pending data channel requests
@@ -255,16 +255,26 @@ async fn handle_connection<T: 'static + Transport>(
     server_config: Arc<ServerConfig>,
     addr: SocketAddr,
 ) -> Result<()> {
-    // Read hello
-    let hello = read_hello(&mut conn).await?;
+    // Read hello with timeout
+    let hello = match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), read_hello(&mut conn)).await {
+        Ok(Ok(hello)) => hello,
+        Ok(Err(e)) => {
+            error!("Failed to read hello: {}", e);
+            return Err(e);
+        }
+        Err(_) => {
+            error!("Read hello timeout");
+            bail!("Operation timed out");
+        }
+    };
 
     match hello {
         ControlChannelHello(protocol_version, service_digest) => {
             let mut timestamp = 0;
 
-            // if version is v2, read timestamp from conn
+            // if a version is v2, read the timestamp from conning
             if protocol_version == PROTO_V2 {
-                // read a u64 timestamp from conn, if not, default set to 0
+                // read an u64 timestamp from conning, if not, default set to 0
                 timestamp = match conn.read_u64_le().await {
                     Ok(ts) => {
                         debug!("read ts from conn success: {}", ts);
@@ -319,7 +329,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     // Send hello
     let hello_send = ControlChannelHello(
-        // if timestamp is 0, use current protocol version, otherwise use v2
+        // if the timestamp is 0, use the current protocol version, otherwise use v2
         if timestamp == 0 {
             protocol::CURRENT_PROTO_VERSION
         } else {
@@ -332,7 +342,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         .await?;
     conn.flush().await?;
 
-    // Lookup the service
+    // Look up the service
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
@@ -349,8 +359,18 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
     concat.append(&mut nonce);
 
-    // Read auth
-    let protocol::Auth(d) = read_auth(&mut conn).await?;
+    // Read auth with timeout
+    let protocol::Auth(d) = match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), read_auth(&mut conn)).await {
+        Ok(Ok(auth)) => auth,
+        Ok(Err(e)) => {
+            error!("Failed to read auth: {}", e);
+            return Err(e);
+        }
+        Err(_) => {
+            error!("Read auth timeout");
+            bail!("Authentication timed out");
+        }
+    };
 
     // Validate
     let session_key = protocol::digest(&concat);
@@ -364,11 +384,11 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         );
         bail!("service {} auth failed", service_name);
     } else {
-        // check if there is an existing channel with the same service, and compare timestamps
+        // check if there is an existing channel with the same service and compare timestamps
         let existing_channel = {
             let control_map_guard = control_channels.read().await;
             if let Some(existing) = control_map_guard.get1(&service_digest) {
-                // if existing channel timestamp is greater than new timestamp, reject new connection
+                // if the existing channel timestamp is greater than new timestamp, reject new connection
                 info!(
                     service = %service_name,
                     old_ts = existing.timestamp,

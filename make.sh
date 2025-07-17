@@ -13,7 +13,7 @@ VERSION=$(grep '^version = ' Cargo.toml | cut -d '"' -f2)
 
 # 设置输出目录
 CURRENT_DATE=$(date +"%Y%m%d")
-OUTPUT_DIR="server_${CURRENT_DATE}_v${VERSION}"
+OUTPUT_DIR="releases/server_${CURRENT_DATE}_v${VERSION}"
 mkdir -p $OUTPUT_DIR
 
 # 安装必要的工具

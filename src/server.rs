@@ -256,14 +256,21 @@ async fn handle_connection<T: 'static + Transport>(
     addr: SocketAddr,
 ) -> Result<()> {
     // Read hello with timeout
-    let hello = match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), read_hello(&mut conn)).await {
+    let hello = match timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT),
+        read_hello(&mut conn),
+    )
+    .await
+    {
         Ok(Ok(hello)) => hello,
         Ok(Err(e)) => {
             error!("Failed to read hello: {}", e);
+            let _ = conn.shutdown().await; // 显式关闭连接以防文件描述符泄露
             return Err(e);
         }
         Err(_) => {
             error!("Read hello timeout");
+            let _ = conn.shutdown().await; // 显式关闭连接以防文件描述符泄露
             bail!("Operation timed out");
         }
     };
@@ -360,17 +367,18 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     concat.append(&mut nonce);
 
     // Read auth with timeout
-    let protocol::Auth(d) = match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), read_auth(&mut conn)).await {
-        Ok(Ok(auth)) => auth,
-        Ok(Err(e)) => {
-            error!("Failed to read auth: {}", e);
-            return Err(e);
-        }
-        Err(_) => {
-            error!("Read auth timeout");
-            bail!("Authentication timed out");
-        }
-    };
+    let protocol::Auth(d) =
+        match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), read_auth(&mut conn)).await {
+            Ok(Ok(auth)) => auth,
+            Ok(Err(e)) => {
+                error!("Failed to read auth: {}", e);
+                return Err(e);
+            }
+            Err(_) => {
+                error!("Read auth timeout");
+                bail!("Authentication timed out");
+            }
+        };
 
     // Validate
     let session_key = protocol::digest(&concat);

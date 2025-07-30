@@ -33,10 +33,10 @@ use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span}
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
-const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP services
-const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
-const CHAN_SIZE: usize = 2048; // The capacity of various chans
-const DATA_CHANNEL_REQUEST_BUFFER: usize = CHAN_SIZE / 2; // Buffer for pending data channel requests
+const TCP_POOL_SIZE: usize = 8; // TCP服务的缓存连接数
+const UDP_POOL_SIZE: usize = 2; // UDP服务的缓存连接数
+const CHAN_SIZE: usize = 2048; // 通道的容量
+const DATA_CHANNEL_REQUEST_BUFFER: usize = CHAN_SIZE / 2; // 等待数据通道请求的缓冲区
 const HANDSHAKE_TIMEOUT: u64 = 5; // 握手超时时间(秒)
 
 // The entrypoint of running a server
@@ -348,6 +348,14 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     rand::thread_rng().fill_bytes(&mut nonce);
 
     // 发送握手消息
+    let nonce_array: [u8; HASH_WIDTH_IN_BYTES] =
+        nonce.clone().try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!(
+                "Nonce 长度不匹配. 期望: {}, 实际: {}",
+                HASH_WIDTH_IN_BYTES,
+                v.len()
+            )
+        })?;
     let hello_send = ControlChannelHello(
         // 如果时间戳为0, 使用当前协议版本, 否则使用v2协议
         if timestamp == 0 {
@@ -355,17 +363,16 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         } else {
             protocol::PROTO_V2
         },
-        nonce.clone().try_into().unwrap(),
+        nonce_array,
     );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
-        .await?;
+    conn.write_all(&bincode::serialize(&hello_send)?).await?;
     conn.flush().await?;
 
     // 查找服务
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist)?)
                 .await?;
             bail!("未找到服务: {}", hex::encode(service_digest));
         }
@@ -375,7 +382,16 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let service_name = service_config.name.clone();
 
     // 计算校验和
-    let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
+    let token = match service_config.token.as_ref() {
+        Some(t) => t.as_bytes(),
+        None => {
+            error!(service = %service_name, "认证失败: 服务未配置token");
+            conn.write_all(&bincode::serialize(&Ack::AuthFailed)?)
+                .await?;
+            bail!("服务 {} 未配置token", service_name);
+        }
+    };
+    let mut concat = Vec::from(token);
     concat.append(&mut nonce);
 
     // 读取认证
@@ -395,7 +411,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     // 验证
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
+        conn.write_all(&bincode::serialize(&Ack::AuthFailed)?)
             .await?;
         debug!(
             "认证失败, 期望 {}, 实际 {}",
@@ -427,7 +443,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                         "拒绝连接: 旧时间戳:{} >= 新时间戳:{}",
                         existing.timestamp, timestamp
                     );
-                    conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
+                    conn.write_all(&bincode::serialize(&Ack::AuthFailed)?)
                         .await?;
                     return Ok(());
                 }
@@ -463,7 +479,6 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             addr,
         );
 
-        let nonce_for_cleanup = session_key;
         let control_channels_weak = Arc::downgrade(&control_channels);
 
         // 插入句柄到映射中(在写锁范围内)
@@ -477,24 +492,24 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                     new_ts = timestamp,
                     old_addr = %existing.addr,
                     new_addr = %addr,
-                    nonce = %hex::encode(nonce_for_cleanup),
+                    session_key = %hex::encode(session_key),
                     "替换旧通道, 创建新控制通道"
                 );
                 let _ = control_map_guard.remove1(&service_digest);
-            } else if control_map_guard.get2(&nonce_for_cleanup).is_some() {
+            } else if control_map_guard.get2(&session_key).is_some() {
                 warn!(
                     service = %service_name,
-                    nonce = %hex::encode(nonce_for_cleanup),
+                    session_key = %hex::encode(session_key),
                     "检测到潜在的会话密钥冲突, 移除旧条目"
                 );
-                let _ = control_map_guard.remove2(&nonce_for_cleanup);
+                let _ = control_map_guard.remove2(&session_key);
             }
 
             // 插入新句柄. `handle` 被移动到映射中
-            let _ = control_map_guard.insert(service_digest, nonce_for_cleanup, handle);
+            let _ = control_map_guard.insert(service_digest, session_key, handle);
             info!(
                 service = %service_name,
-                nonce = %hex::encode(nonce_for_cleanup),
+                session_key = %hex::encode(session_key),
                 ts = timestamp,
                 addr = %addr,
                 "控制通道句柄插入成功"
@@ -503,24 +518,23 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
         // 克隆名称再次用于跨度, 因为原始名称被移动到任务中
         let service_name_for_control_span = service_name.clone();
-        let nonce_for_control_span = nonce_for_cleanup;
 
         // 启动控制任务
         let control_task_handle = tokio::spawn(
             async move {
                 // `prepare` 返回的 future 拥有连接并运行 `ControlChannel::run`
                 if let Err(err) = control_task_future.await {
-                    error!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "控制通道任务失败: {:#}", err);
+                    error!(service = %service_name, session_key = %hex::encode(session_key), "控制通道任务失败: {:#}", err);
                 } else {
-                    debug!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "控制通道任务完成");
+                    debug!(service = %service_name, session_key = %hex::encode(session_key), "控制通道任务完成");
                 }
             }
             // 使用新克隆的变量进行跨度
-            .instrument(info_span!("控制通道任务", service = %service_name_for_control_span, nonce = %hex::encode(nonce_for_control_span))),
+            .instrument(info_span!("控制通道任务", service = %service_name_for_control_span, session_key = %hex::encode(session_key))),
         );
 
-        // 克隆nonce, 专门用于清理任务的跨度
-        let nonce_for_cleanup_span_only = nonce_for_cleanup;
+        // 为清理任务克隆会话密钥
+        let session_key_for_cleanup = session_key;
 
         // 启动清理任务
         tokio::spawn(
@@ -528,27 +542,27 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                 // 等待主控制任务完成(正常或异常)
                 match control_task_handle.await {
                     Ok(_) => {
-                        debug!(nonce = %hex::encode(nonce_for_cleanup), "控制通道任务完成, 准备清理");
+                        debug!(session_key = %hex::encode(session_key_for_cleanup), "控制通道任务完成, 准备清理");
                     },
                     Err(e) => {
-                        error!(nonce = %hex::encode(nonce_for_cleanup), "控制通道任务失败, 准备清理: {}", e);
+                        error!(session_key = %hex::encode(session_key_for_cleanup), "控制通道任务失败, 准备清理: {}", e);
                     }
                 }
 
                 if let Some(map_arc) = control_channels_weak.upgrade() {
-                    debug!(nonce = %hex::encode(nonce_for_cleanup), "获取锁, 准备清理");
+                    debug!(session_key = %hex::encode(session_key_for_cleanup), "获取锁, 准备清理");
                     let mut map_guard = map_arc.write().await;
-                    if let Some(_removed_handle) = map_guard.remove2(&nonce_for_cleanup) {
-                        info!(nonce = %hex::encode(nonce_for_cleanup), "控制通道句柄清理成功");
+                    if let Some(_removed_handle) = map_guard.remove2(&session_key_for_cleanup) {
+                        info!(session_key = %hex::encode(session_key_for_cleanup), "控制通道句柄清理成功");
                     } else {
-                        warn!(nonce = %hex::encode(nonce_for_cleanup), "控制通道句柄在清理前被移除");
+                        warn!(session_key = %hex::encode(session_key_for_cleanup), "控制通道句柄在清理前被移除");
                     }
                 } else {
-                    warn!(nonce = %hex::encode(nonce_for_cleanup), "控制通道映射在清理前被释放");
+                    warn!(session_key = %hex::encode(session_key_for_cleanup), "控制通道映射在清理前被释放");
                 }
             }
-            // 使用特定于跨度的克隆的nonce来记录清理任务
-            .instrument(info_span!("cleanup_task", nonce = %hex::encode(nonce_for_cleanup_span_only))),
+            // 使用特定于跨度的克隆的会话密钥来记录清理任务
+            .instrument(info_span!("cleanup_task", session_key = %hex::encode(session_key_for_cleanup))),
         );
     }
 
@@ -606,47 +620,44 @@ where
         timestamp: u64,
         addr: SocketAddr,
     ) -> (Self, impl Future<Output = Result<()>> + Send + 'static) {
-        // Create shutdown channel, data channel queue, request channel (Bounded now)
-        let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
-        let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2);
-        let (data_ch_req_tx, data_ch_req_rx) = mpsc::channel(DATA_CHANNEL_REQUEST_BUFFER);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1); // 关闭channel
+        let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2); // 数据channel队列
+        let (data_ch_req_tx, data_ch_req_rx) = mpsc::channel(DATA_CHANNEL_REQUEST_BUFFER); // 缓冲区
 
-        // Calculate pool size (remains the same)
+        // 获得 TCP 或 UDP 的服务池大小
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
         };
 
-        // Spawn a connection pool task (remains the same, takes ownership of relevant channels)
+        // 启动连接池任务 (获取相关通道的所有权)
         let service_name_clone = service.name.clone();
 
-        // Clone name again for spans before moving into tasks
+        // 克隆服务名称用于跨度
         let service_name_for_tcp_span = service_name_clone.clone();
         let service_name_for_udp_span = service_name_clone.clone();
 
         match service.service_type {
             ServiceType::Tcp => {
-                let shutdown_rx_clone = shutdown_tx.subscribe();
-                let bind_addr = service.bind_addr.clone();
-                let data_ch_req_tx_clone = data_ch_req_tx.clone(); // Clone sender for the pool task
+                let shutdown_rx_clone = shutdown_tx.subscribe(); // 订阅关闭channel
+                let bind_addr = service.bind_addr.clone(); // 绑定地址
+                let data_ch_req_tx_clone = data_ch_req_tx.clone(); // 克隆发送者
                 tokio::spawn(
                     async move {
-                        // Use moved service_name_clone inside a task
+                        // 运行TCP连接池任务
                         if let Err(e) = run_tcp_connection_pool::<T>(
                             bind_addr,
-                            data_ch_rx, // data_ch_rx moved here
+                            data_ch_rx,
                             data_ch_req_tx_clone,
                             shutdown_rx_clone,
                         )
                         .await
-                        .with_context(|| "TCP connection pool task failed")
+                        .with_context(|| "运行TCP连接池任务失败")
                         {
-                            error!("{:#}", e);
+                            error!("TCP连接池任务失败: {:#}", e);
                         }
-                        // Use moved service_name_clone for debug log
-                        debug!(service = %service_name_clone, "TCP connection pool task finished.");
+                        debug!(service = %service_name_clone, "TCP连接池任务完成");
                     }
-                    // Use span-specific clone
                     .instrument(info_span!("tcp_pool", service = %service_name_for_tcp_span)),
                 );
             }

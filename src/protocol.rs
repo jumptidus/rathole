@@ -193,15 +193,15 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     let mut buf = vec![0u8; PACKET_LEN.hello];
     conn.read_exact(&mut buf)
         .await
-        .with_context(|| "Failed to read hello")?;
-    let hello = bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
+        .with_context(|| "读取握手消息失败")?;
+    let hello = bincode::deserialize(&buf).with_context(|| "反序列化握手消息失败")?;
 
     match hello {
         Hello::ControlChannelHello(v, _) => {
             // 服务端兼容v2和v1
             if v != CURRENT_PROTO_VERSION && v != PROTO_V2 {
                 bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
+                    "协议版本不匹配. 期望 {}, 实际 {}. 请更新 `rathole`.",
                     CURRENT_PROTO_VERSION,
                     v
                 );
@@ -211,7 +211,7 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
             // 服务端兼容v2和v1
             if v != CURRENT_PROTO_VERSION && v != PROTO_V2 {
                 bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
+                    "协议版本不匹配. 期望 {}, 实际 {}. 请更新 `rathole`.",
                     CURRENT_PROTO_VERSION,
                     v
                 );

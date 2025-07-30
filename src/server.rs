@@ -37,7 +37,7 @@ const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP serv
 const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const DATA_CHANNEL_REQUEST_BUFFER: usize = CHAN_SIZE / 2; // Buffer for pending data channel requests
-const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+const HANDSHAKE_TIMEOUT: u64 = 5; // 握手超时时间(秒)
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -166,42 +166,46 @@ impl<T: 'static + Transport> Server<T> {
                                 // EMFILE. So sleep for a while and retry
                                 // TODO: Only sleep for EMFILE, ENFILE, ENOMEM, ENOBUFS
                                 if let Some(d) = backoff.next_backoff() {
-                                    error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
+                                    error!("IO错误: {:#}. 重试中... {:?}...", err, d);
                                     time::sleep(d).await;
                                 } else {
                                     // This branch will never be executed according to the current retry policy
-                                    error!("Too many retries. Aborting...");
+                                    error!("[预期之外的错误] 当前重试策略不应到达,重试次数过多. 终止...");
                                     break;
                                 }
+                            } else {
+                                // If it's not an IO error, then it comes from
+                                // the transport layer, so ignore it
+                                // just log it
+                                error!("[预期之外的错误] 传输层错误: {:#}", err);
                             }
-                            // If it's not an IO error, then it comes from
-                            // the transport layer, so ignore it
                         }
                         Ok((conn, addr)) => {
                             backoff.reset();
 
-                            // Do transport handshake with a timeout
-                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
-                                Ok(conn) => {
-                                    match conn.with_context(|| "Failed to do transport handshake") {
-                                        Ok(conn) => {
-                                            let services = self.services.clone();
-                                            let control_channels = self.control_channels.clone();
-                                            let server_config = self.config.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, addr).await {
-                                                    error!("{:#}", err);
+                            let transport = self.transport.clone();
+                            let services = self.services.clone();
+                            let control_channels = self.control_channels.clone();
+                            let server_config = self.config.clone();
+
+                            tokio::spawn(async move {
+                                match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), transport.handshake(conn)).await {
+                                    Ok(conn_result) => {
+                                        match conn_result.with_context(|| "握手失败") {
+                                            Ok(stream) => {
+                                                if let Err(err) = handle_connection(stream, services, control_channels, server_config, addr).await {
+                                                    error!("握手成功, 处理连接失败: {:#}", err);
                                                 }
-                                            }.instrument(info_span!("connection", %addr)));
-                                        }, Err(e) => {
-                                            error!("{:#}", e);
+                                            }, Err(e) => {
+                                                error!("握手成功, 处理连接失败: {:#}", e);
+                                            }
                                         }
+                                    },
+                                    Err(e) => {
+                                        error!("握手超时: {}", e);
                                     }
-                                },
-                                Err(e) => {
-                                    error!("Transport handshake timeout: {}", e);
                                 }
-                            }
+                            }.instrument(info_span!("握手成功", %addr))); // 握手成功后，进入握手成功处理流程
                         }
                     }
                 },
@@ -255,7 +259,7 @@ async fn handle_connection<T: 'static + Transport>(
     server_config: Arc<ServerConfig>,
     addr: SocketAddr,
 ) -> Result<()> {
-    // Read hello with timeout
+    // 读取握手消息
     let hello = match timeout(
         Duration::from_secs(HANDSHAKE_TIMEOUT),
         read_hello(&mut conn),
@@ -264,38 +268,47 @@ async fn handle_connection<T: 'static + Transport>(
     {
         Ok(Ok(hello)) => hello,
         Ok(Err(e)) => {
-            error!("Failed to read hello: {}", e);
-            let _ = conn.shutdown().await; // 显式关闭连接以防文件描述符泄露
+            let _ = conn.shutdown().await;
+            error!("读取握手消息失败: {}, 显式关闭连接以防资源泄露", e);
             return Err(e);
         }
         Err(_) => {
-            error!("Read hello timeout");
-            let _ = conn.shutdown().await; // 显式关闭连接以防文件描述符泄露
-            bail!("Operation timed out");
+            let _ = conn.shutdown().await;
+            error!("握手超时, 显式关闭连接以防资源泄露");
+            bail!("握手超时");
         }
     };
 
+    // 处理握手消息
     match hello {
         ControlChannelHello(protocol_version, service_digest) => {
-            let mut timestamp = 0;
-
-            // if a version is v2, read the timestamp from conning
-            if protocol_version == PROTO_V2 {
-                // read an u64 timestamp from conning, if not, default set to 0
-                timestamp = match conn.read_u64_le().await {
-                    Ok(ts) => {
-                        debug!("read ts from conn success: {}", ts);
+            // 根据协议版本处理时间戳
+            let timestamp = if protocol_version == PROTO_V2 {
+                // 对于V2协议, 客户端必须发送时间戳
+                match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), conn.read_u64_le()).await {
+                    Ok(Ok(ts)) => {
+                        debug!("成功读取V2客户端时间戳: {}", ts);
                         ts
                     }
-                    Err(e) => {
-                        // if EOF or connection closed, it means no timestamp
-                        debug!("failed to read timestamp, maybe old version client: {}", e);
-                        0
+                    Ok(Err(e)) => {
+                        error!("读取V2客户端时间戳失败: {}, 中断连接", e);
+                        let _ = conn.shutdown().await;
+                        return Err(e.into());
                     }
-                };
-            }
-            info!("client timestamp: {}", timestamp);
+                    Err(_) => {
+                        error!("读取V2客户端时间戳超时, 中断连接");
+                        let _ = conn.shutdown().await;
+                        bail!("读取时间戳超时");
+                    }
+                }
+            } else {
+                // 对于旧版协议, 时间戳为0
+                0
+            };
 
+            info!("客户端时间戳: {}", timestamp);
+
+            // 处理控制通道握手
             do_control_channel_handshake(
                 conn,
                 services,
@@ -324,19 +337,19 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     addr: SocketAddr,
 ) -> Result<()> {
     info!(
-        "try to establish control channel, client timestamp: {}, addr: {}",
+        "尝试建立控制通道, 客户端时间戳: {}, 地址: {}",
         timestamp, addr
     );
 
     T::hint(&conn, SocketOpts::for_control_channel());
 
-    // Generate a nonce
+    // 生成一个nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
     rand::thread_rng().fill_bytes(&mut nonce);
 
-    // Send hello
+    // 发送握手消息
     let hello_send = ControlChannelHello(
-        // if the timestamp is 0, use the current protocol version, otherwise use v2
+        // 如果时间戳为0, 使用当前协议版本, 否则使用v2协议
         if timestamp == 0 {
             protocol::CURRENT_PROTO_VERSION
         } else {
@@ -344,66 +357,65 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         },
         nonce.clone().try_into().unwrap(),
     );
-
     conn.write_all(&bincode::serialize(&hello_send).unwrap())
         .await?;
     conn.flush().await?;
 
-    // Look up the service
+    // 查找服务
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
             conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
                 .await?;
-            bail!("not found service: {}", hex::encode(service_digest));
+            bail!("未找到服务: {}", hex::encode(service_digest));
         }
     }
     .to_owned();
 
     let service_name = service_config.name.clone();
 
-    // Calculate the checksum
+    // 计算校验和
     let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
     concat.append(&mut nonce);
 
-    // Read auth with timeout
+    // 读取认证
     let protocol::Auth(d) =
         match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), read_auth(&mut conn)).await {
             Ok(Ok(auth)) => auth,
             Ok(Err(e)) => {
-                error!("Failed to read auth: {}", e);
+                error!("读取认证失败: {}", e);
                 return Err(e);
             }
             Err(_) => {
-                error!("Read auth timeout");
-                bail!("Authentication timed out");
+                error!("读取认证超时");
+                bail!("认证超时");
             }
         };
 
-    // Validate
+    // 验证
     let session_key = protocol::digest(&concat);
     if session_key != d {
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
         debug!(
-            "auth failed, expect {}, actual {}",
+            "认证失败, 期望 {}, 实际 {}",
             hex::encode(session_key),
             hex::encode(d)
         );
-        bail!("service {} auth failed", service_name);
+        bail!("服务 {} 认证失败", service_name);
     } else {
-        // check if there is an existing channel with the same service and compare timestamps
+        // 检查是否存在一个相同的通道, 并比较时间戳
         let existing_channel = {
             let control_map_guard = control_channels.read().await;
             if let Some(existing) = control_map_guard.get1(&service_digest) {
-                // if the existing channel timestamp is greater than new timestamp, reject new connection
+                // 如果旧的时间戳大于新时间戳, 拒绝新连接
                 info!(
                     service = %service_name,
                     old_ts = existing.timestamp,
                     old_addr = %existing.addr,
                     new_ts = timestamp,
                     new_addr = %addr,
-                    "found existing channel"
+                    "找到一个相同的通道"
                 );
                 if existing.timestamp >= timestamp {
                     info!(
@@ -412,7 +424,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                         old_addr = %existing.addr,
                         new_ts = timestamp,
                         new_addr = %addr,
-                        "reject connection: old_ts:{} >= new_ts:{}",
+                        "拒绝连接: 旧时间戳:{} >= 新时间戳:{}",
                         existing.timestamp, timestamp
                     );
                     conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
@@ -425,7 +437,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                     old_addr = %existing.addr,
                     new_ts = timestamp,
                     new_addr = %addr,
-                    "replace existing channel"
+                    "替换旧通道"
                 );
                 true
             } else {
@@ -438,11 +450,11 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                 service = %service_name,
                 new_ts = timestamp,
                 new_addr = %addr,
-                "create or replace control channel"
+                "创建或替换控制通道"
             );
         }
 
-        // 1. Prepare Handle and Control Task Future
+        // 准备控制通道句柄和控制任务
         let (handle, control_task_future) = ControlChannelHandle::prepare(
             conn,
             service_config.clone(),
@@ -454,7 +466,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         let nonce_for_cleanup = session_key;
         let control_channels_weak = Arc::downgrade(&control_channels);
 
-        // 2. Insert Handle into the Map (within a write lock scope)
+        // 插入句柄到映射中(在写锁范围内)
         {
             let mut control_map_guard = control_channels.write().await;
 
@@ -466,80 +478,76 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                     old_addr = %existing.addr,
                     new_addr = %addr,
                     nonce = %hex::encode(nonce_for_cleanup),
-                    "replace old channel, create new control channel"
+                    "替换旧通道, 创建新控制通道"
                 );
                 let _ = control_map_guard.remove1(&service_digest);
             } else if control_map_guard.get2(&nonce_for_cleanup).is_some() {
                 warn!(
                     service = %service_name,
                     nonce = %hex::encode(nonce_for_cleanup),
-                    "potential session key conflict detected, remove old entry"
+                    "检测到潜在的会话密钥冲突, 移除旧条目"
                 );
                 let _ = control_map_guard.remove2(&nonce_for_cleanup);
             }
 
-            // Insert the new handle. `handle` is moved into the map.
+            // 插入新句柄. `handle` 被移动到映射中
             let _ = control_map_guard.insert(service_digest, nonce_for_cleanup, handle);
             info!(
                 service = %service_name,
                 nonce = %hex::encode(nonce_for_cleanup),
                 ts = timestamp,
                 addr = %addr,
-                "control channel handle inserted"
+                "控制通道句柄插入成功"
             );
         }
 
-        // Clone names again for the spans, as the original is moved into the tasks
+        // 克隆名称再次用于跨度, 因为原始名称被移动到任务中
         let service_name_for_control_span = service_name.clone();
         let nonce_for_control_span = nonce_for_cleanup;
 
-        // 3. Spawn the Main Control Task
+        // 启动控制任务
         let control_task_handle = tokio::spawn(
             async move {
-                // The future returned by `prepare`
-                // owns the connection and runs `ControlChannel::run`
+                // `prepare` 返回的 future 拥有连接并运行 `ControlChannel::run`
                 if let Err(err) = control_task_future.await {
-                    // Use moved variables inside the task
-                    error!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "control channel task failed: {:#}", err);
+                    error!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "控制通道任务失败: {:#}", err);
                 } else {
-                    debug!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "control channel task completed successfully");
+                    debug!(service = %service_name, nonce = %hex::encode(nonce_for_cleanup), "控制通道任务完成");
                 }
             }
-            // Instrument the task - Use the newly cloned variables for the span
-            .instrument(info_span!("control_task", service = %service_name_for_control_span, nonce = %hex::encode(nonce_for_control_span))),
+            // 使用新克隆的变量进行跨度
+            .instrument(info_span!("控制通道任务", service = %service_name_for_control_span, nonce = %hex::encode(nonce_for_control_span))),
         );
 
-        // Clone nonce again specifically for the cleanup task's span
+        // 克隆nonce, 专门用于清理任务的跨度
         let nonce_for_cleanup_span_only = nonce_for_cleanup;
 
-        // 4. Spawn the Cleanup Task
+        // 启动清理任务
         tokio::spawn(
             async move {
-                // Wait for the main control task to complete (normally or abnormally)
+                // 等待主控制任务完成(正常或异常)
                 match control_task_handle.await {
                     Ok(_) => {
-                        // Use moved nonce inside
-                        debug!(nonce = %hex::encode(nonce_for_cleanup), "control task completed, prepare to cleanup");
+                        debug!(nonce = %hex::encode(nonce_for_cleanup), "控制通道任务完成, 准备清理");
                     },
                     Err(e) => {
-                        // Use moved nonce inside
-                        error!(nonce = %hex::encode(nonce_for_cleanup), "control task failed, prepare to cleanup: {}", e);
+                        error!(nonce = %hex::encode(nonce_for_cleanup), "控制通道任务失败, 准备清理: {}", e);
                     }
                 }
 
                 if let Some(map_arc) = control_channels_weak.upgrade() {
-                    debug!(nonce = %hex::encode(nonce_for_cleanup), "get lock, prepare to cleanup");
+                    debug!(nonce = %hex::encode(nonce_for_cleanup), "获取锁, 准备清理");
                     let mut map_guard = map_arc.write().await;
                     if let Some(_removed_handle) = map_guard.remove2(&nonce_for_cleanup) {
-                        info!(nonce = %hex::encode(nonce_for_cleanup), "control channel handle removed successfully");
+                        info!(nonce = %hex::encode(nonce_for_cleanup), "控制通道句柄清理成功");
                     } else {
-                        warn!(nonce = %hex::encode(nonce_for_cleanup), "control channel handle removed before cleanup");
+                        warn!(nonce = %hex::encode(nonce_for_cleanup), "控制通道句柄在清理前被移除");
                     }
                 } else {
-                    warn!(nonce = %hex::encode(nonce_for_cleanup), "control channel map released before cleanup");
+                    warn!(nonce = %hex::encode(nonce_for_cleanup), "控制通道映射在清理前被释放");
                 }
             }
-            // Instrument the cleanup task - Use the span-specific cloned nonce
+            // 使用特定于跨度的克隆的nonce来记录清理任务
             .instrument(info_span!("cleanup_task", nonce = %hex::encode(nonce_for_cleanup_span_only))),
         );
     }

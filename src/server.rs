@@ -27,7 +27,7 @@ use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio::time::{self, timeout, Instant};
+use tokio::time::{self, error, timeout, Instant};
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
@@ -144,7 +144,7 @@ impl<T: 'static + Transport> Server<T> {
             .bind(&self.config.bind_addr)
             .await
             .with_context(|| "Failed to listen at `server.bind_addr`")?;
-        info!("Listening at {}", self.config.bind_addr);
+        info!("开始监听: {}", self.config.bind_addr);
 
         // Retry at least every 100 ms
         let mut backoff = ExponentialBackoff {
@@ -479,7 +479,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             addr,
         );
 
-        let control_channels_weak = Arc::downgrade(&control_channels);
+        let control_channels_weak = Arc::downgrade(&control_channels); // 弱引用控制通道句柄
 
         // 插入句柄到映射中(在写锁范围内)
         {
@@ -652,11 +652,11 @@ where
                             shutdown_rx_clone,
                         )
                         .await
-                        .with_context(|| "运行TCP连接池任务失败")
+                        .with_context(|| "TCP 连接池任务失败")
                         {
-                            error!("TCP连接池任务失败: {:#}", e);
+                            error!("TCP 连接池任务失败: {:#}", e);
                         }
-                        debug!(service = %service_name_clone, "TCP连接池任务完成");
+                        debug!(service = %service_name_clone, "TCP 连接池任务结束.");
                     }
                     .instrument(info_span!("tcp_pool", service = %service_name_for_tcp_span)),
                 );
@@ -667,7 +667,6 @@ where
                 let data_ch_req_tx_clone = data_ch_req_tx.clone(); // Clone sender for the pool task
                 tokio::spawn(
                     async move {
-                        // Use moved service_name_clone inside a task
                         if let Err(e) = run_udp_connection_pool::<T>(
                             bind_addr,
                             data_ch_rx,           // data_ch_rx moved here
@@ -675,12 +674,12 @@ where
                             shutdown_rx_clone,
                         )
                         .await
-                        .with_context(|| "UDP connection pool task failed")
+                        .with_context(|| "UDP 连接池任务失败")
                         {
-                            error!("{:#}", e);
+                            error!("UDP 连接池任务失败: {:#}", e);
                         }
                         // Use moved service_name_clone for debug log
-                        debug!(service = %service_name_clone, "UDP connection pool task finished.");
+                        debug!(service = %service_name_clone, "UDP 连接池任务结束.");
                     }
                     // Use span-specific clone
                     .instrument(info_span!("udp_pool", service = %service_name_for_udp_span)),
@@ -688,7 +687,7 @@ where
             }
         };
 
-        // Create the ControlChannel state struct
+        // 创建控制通道状态结构
         // (takes ownership of conn, shutdown_rx, data_ch_req_rx)
         let ch = ControlChannel::<T> {
             conn,
@@ -699,7 +698,7 @@ where
             data_ch_req_tx: data_ch_req_tx.clone(),
         };
 
-        // Create the handle instance (returned to caller)
+        // 创建控制通道句柄实例（返回给调用者）
         let handle = ControlChannelHandle {
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
@@ -708,22 +707,22 @@ where
             addr,
         };
 
-        // Create the Future that will execute the control channel logic
+        // 创建控制通道 Future，将执行控制通道逻辑
         let control_task_future = async move { ch.run().await }.instrument(Span::current());
 
-        // Return the handle and the future
+        // 创建控制通道句柄实例（返回给调用者）
         (handle, control_task_future)
     }
 }
 
 // Control channel, using T as the transport layer.
 struct ControlChannel<T: Transport> {
-    conn: T::Stream,                        // The connection of control channel
-    shutdown_rx: broadcast::Receiver<bool>, // Receives the shutdown signal
-    data_ch_req_rx: mpsc::Receiver<bool>,   // Receives visitor connections (Bounded Receiver)
-    heartbeat_interval: u64,                // Application-layer heartbeat interval in secs
-    pool_size: usize,                       // Initial pool size to request
-    data_ch_req_tx: mpsc::Sender<bool>,     // Sender to request data channels (Bounded Sender)
+    conn: T::Stream, // The connection of control channel // 控制通道连接
+    shutdown_rx: broadcast::Receiver<bool>, // Receives the shutdown signal // 接收关闭信号
+    data_ch_req_rx: mpsc::Receiver<bool>, // Receives visitor connections (Bounded Receiver) // 接收访客连接请求（有界接收器）
+    heartbeat_interval: u64, // Application-layer heartbeat interval in secs // 应用层心跳间隔（秒）
+    pool_size: usize,        // Initial pool size to request // 初始池大小请求
+    data_ch_req_tx: mpsc::Sender<bool>, // Sender to request data channels (Bounded Sender) // 发送器请求数据通道（有界发送器）
 }
 
 impl<T: Transport> ControlChannel<T> {
@@ -817,57 +816,55 @@ fn tcp_listen_and_send(
         let l = retry_notify_with_deadline(listen_backoff(),  || async {
             Ok(TcpListener::bind(&addr).await?)
         }, |e, duration| {
-            error!("{:#}. Retry in {:?}", e, duration);
+            error!("{:#}. 重试间隔: {:?}", e, duration);
         }, &mut shutdown_rx).await
-        .with_context(|| "Failed to listen for the service");
+        .with_context(|| "监听服务失败");
 
         let l: TcpListener = match l {
             Ok(v) => v,
             Err(e) => {
-                error!("{:#}", e);
+                error!("监听服务失败: {:#}", e);
                 return;
             }
         };
 
-        info!("Listening at {}", &addr);
+        info!("开始监听: {}", &addr);
 
-        // Retry at least every 1s
+        // 重试至少每1秒
         let mut backoff = ExponentialBackoff {
             max_interval: Duration::from_secs(1),
             max_elapsed_time: None,
             ..Default::default()
         };
 
-        // Wait for visitors and the shutdown signal
+		// 主循环
         loop {
             tokio::select! {
                 val = l.accept() => {
                     match val {
                         Err(e) => {
-                            // `l` is a TCP listener, so this must be an IO error
-                            // Possibly a EMFILE. So sleep for a while
-                            error!("{}. Sleep for a while", e);
+                            // `l` 是 TCP 监听器, 所以这必须是 IO 错误
+                            // 可能是 EMFILE. 所以等待一段时间
+                            error!("{}. 等待一段时间", e);
                             if let Some(d) = backoff.next_backoff() {
                                 time::sleep(d).await;
                             } else {
-                                // This branch will never be reached for current backoff policy
-                                error!("Too many retries. Aborting...");
+                                // 重试次数太多, 退出
+                                error!("[FOCUS ERROR] TCP 监听 Accept 重试次数到达极限. 退出...");
                                 break;
                             }
                         }
                         Ok((incoming, addr)) => {
-                            // For every visitor, request to create a data channel
-                            // Use .await and handle error for the bounded channel send
+                            // 对于每个访问者, 请求创建一个数据通道
+                            // 使用 .await 和处理有界通道发送的错误
                             if let Err(e) = data_ch_req_tx.send(true).await {
-                                error!("Failed to send data channel request (likely control channel closed): {}. Listener exiting.", e);
-                                break; // Exit the loop if send fails
+								error!("发送数据通道请求失败 (可能控制通道已关闭): {}. 监听器退出.", e);
+                                break; // 如果发送失败, 退出循环
                             }
+                            backoff.reset(); // 重置重试计数器
+                            debug!("新的客户端连接: {}", addr);
 
-                            backoff.reset();
-
-                            debug!("New visitor from {}", addr);
-
-                            // Send the visitor to the connection pool
+                            // 将访问者发送到连接池
                             let _ = tx.send(incoming).await;
                         }
                     }
@@ -878,7 +875,7 @@ fn tcp_listen_and_send(
             }
         }
 
-        info!("TCPListener shutdown");
+        info!("TCP监听器关闭");
     }.instrument(Span::current()));
 
     rx
@@ -897,7 +894,9 @@ async fn run_tcp_connection_pool<T: Transport>(
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
+                // 写入开始传输Tcp数据指令
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    // 开始传输数据
                     tokio::spawn(async move {
                         let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                     });
@@ -906,9 +905,14 @@ async fn run_tcp_connection_pool<T: Transport>(
                     // The Current data channel is broken.
                     // Request for a new one
                     // Use .await and handle error for the bounded channel send
+                    // 如果当前数据通道已损坏，则请求一个新的数据通道
+                    // 使用 .await 并且处理错误
                     if let Err(e) = data_ch_req_tx.send(true).await {
-                        error!("Failed to send data channel request (likely control channel closed): {}. Pool exiting.", e);
-                        break 'pool; // Exit the outer loop if send fails
+                        error!(
+                            "发送新建数据通道请求失败(控制通道可能已关闭): {}. 关闭连接池.",
+                            e
+                        );
+                        break 'pool; // 控制通道可能已关闭,数据通道无法新建,现在关闭连接池.
                     }
                 }
             } else {
@@ -917,7 +921,7 @@ async fn run_tcp_connection_pool<T: Transport>(
         }
     }
 
-    info!("Shutdown");
+    info!("[FOCUS ERROR] TCP连接池已关闭");
     Ok(())
 }
 
@@ -930,21 +934,21 @@ async fn run_udp_connection_pool<T: Transport>(
 ) -> Result<()> {
     const UDP_READ_TIMEOUT: Duration = Duration::from_secs(10); // UDP Read Timeout
     const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10); // UDP Write Timeout
-    const UDP_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(300); // 5分钟
+    const UDP_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60 * 5); // 5分钟
 
     // 绑定UDP监听socket
     let l = retry_notify_with_deadline(
         listen_backoff(),
         || async { Ok(UdpSocket::bind(&bind_addr).await?) },
         |e, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
+            warn!("{:#}. UDP 绑定错误 {:?}", e, duration);
         },
         &mut shutdown_rx,
     )
     .await
-    .with_context(|| "Failed to listen for the service")?;
+    .with_context(|| "监听失败 Udp service")?;
 
-    info!("Listening at {}", &bind_addr);
+    info!("UDP 监听在 {}", &bind_addr);
 
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp)?;
     let mut buf = [0u8; UDP_BUFFER_SIZE];
@@ -957,23 +961,22 @@ async fn run_udp_connection_pool<T: Transport>(
             Some(mut c) => {
                 match timeout(UDP_WRITE_TIMEOUT, write_and_flush(&mut c, &cmd)).await {
                     Ok(Ok(_)) => {
-                        debug!("UDP connection established");
+                        debug!("UDP 连接建立...");
                         c
                     }
                     Ok(Err(e)) => {
-                        error!("Failed to send start command: {}", e);
-                        // 请求新连接
+                        error!("发送开始传输命令失败: {},数据通道可能损坏,请求新通道", e);
                         if let Err(e) = data_ch_req_tx.send(true).await {
-                            error!("Failed to request new data channel: {}", e);
+                            error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
                             break;
                         }
                         continue;
                     }
                     Err(_) => {
-                        error!("Timeout sending start command");
+                        error!("发送开始传输命令超时,数据通道可能已suai,请求新通道.");
                         // 请求新连接
                         if let Err(e) = data_ch_req_tx.send(true).await {
-                            error!("Failed to request new data channel: {}", e);
+                            error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
                             break;
                         }
                         continue;
@@ -981,7 +984,7 @@ async fn run_udp_connection_pool<T: Transport>(
                 }
             }
             None => {
-                error!("Data channel receiver closed");
+                error!("数据通道接收器已关闭");
                 break;
             }
         };
@@ -997,19 +1000,19 @@ async fn run_udp_connection_pool<T: Transport>(
                             match timeout(UDP_WRITE_TIMEOUT, UdpTraffic::write_slice(&mut conn, from, &buf[..n])).await {
                                 Ok(Ok(_)) => {},
                                 Ok(Err(e)) => {
-                                    error!("Failed to write UDP traffic to client: {}", e);
+                                    error!("写入UDP数据失败: {},数据通道可能损坏,请求新数据通道", e);
                                     // 连接失败，重建
                                     if let Err(e) = data_ch_req_tx.send(true).await {
-                                        error!("Failed to request new data channel: {}", e);
+                                        error!("请求新数据通道失败: {},关闭循环", e);
                                         break 'main_loop;
                                     }
                                     break 'data_loop;
                                 },
                                 Err(_) => {
-                                    error!("Timeout writing UDP traffic to client");
+                                    error!("写入UDP数据超时,数据通道可能损坏,请求新数据通道");
                                     // 连接失败，重建
                                     if let Err(e) = data_ch_req_tx.send(true).await {
-                                        error!("Failed to request new data channel: {}", e);
+                                        error!("请求新数据通道失败: {}", e);
                                         break 'main_loop;
                                     }
                                     break 'data_loop;
@@ -1022,9 +1025,9 @@ async fn run_udp_connection_pool<T: Transport>(
                         Err(_) => {
                             // 读取超时，检查整体活动超时
                             if last_activity.elapsed() > UDP_ACTIVITY_TIMEOUT {
-                                warn!("UDP connection inactive for too long, reconnecting...");
+                                warn!("UDP连接已闲置超过5分钟，重新连接...");
                                 if let Err(e) = data_ch_req_tx.send(true).await {
-                                    error!("Failed to request new data channel: {}", e);
+                                    error!("请求新数据通道失败: {}", e);
                                     break 'main_loop;
                                 }
                                 break 'data_loop;
@@ -1041,23 +1044,23 @@ async fn run_udp_connection_pool<T: Transport>(
                                 Ok(Ok(traffic)) => {
                                     last_activity = Instant::now();
                                     if let Err(e) = l.send_to(&traffic.data, traffic.from).await {
-                                        error!("Failed to send UDP data to visitor: {}", e);
+                                        error!("发送UDP数据到客户端失败: {}", e);
                                     }
                                 },
                                 Ok(Err(e)) => {
-                                    error!("Failed to read UDP traffic from client: {}", e);
+                                    error!("从客户端接收UDP数据失败: {}", e);
                                     // 连接失败，重建
                                     if let Err(e) = data_ch_req_tx.send(true).await {
-                                        error!("Failed to request new data channel: {}", e);
+                                        error!("请求数据通道失败: {}", e);
                                         break 'main_loop;
                                     }
                                     break 'data_loop;
                                 },
                                 Err(_) => {
-                                    error!("Timeout reading UDP traffic from client");
+                                    error!("从客户端接收UDP数据失败, 连接失败，重建");
                                     // 连接失败，重建
                                     if let Err(e) = data_ch_req_tx.send(true).await {
-                                        error!("Failed to request new data channel: {}", e);
+                                        error!("请求数据通道失败: {}", e);
                                         break 'main_loop;
                                     }
                                     break 'data_loop;
@@ -1065,10 +1068,10 @@ async fn run_udp_connection_pool<T: Transport>(
                             }
                         },
                         Ok(Err(e)) => {
-                            error!("UDP connection read error: {}", e);
+                            error!("UDP连接读取错误: {}", e);
                             // 连接失败，重建
                             if let Err(e) = data_ch_req_tx.send(true).await {
-                                error!("Failed to request new data channel: {}", e);
+                                error!("请求数据通道失败: {}", e);
                                 break 'main_loop;
                             }
                             break 'data_loop;
@@ -1076,9 +1079,9 @@ async fn run_udp_connection_pool<T: Transport>(
                         Err(_) => {
                             // 读取超时，检查整体活动超时
                             if last_activity.elapsed() > UDP_ACTIVITY_TIMEOUT {
-                                warn!("UDP connection inactive for too long, reconnecting...");
+                                warn!("UDP 连接超时，重建...");
                                 if let Err(e) = data_ch_req_tx.send(true).await {
-                                    error!("Failed to request new data channel: {}", e);
+                                    error!("请求数据通道失败: {}", e);
                                     break 'main_loop;
                                 }
                                 break 'data_loop;
@@ -1089,7 +1092,7 @@ async fn run_udp_connection_pool<T: Transport>(
 
                 // 处理关闭信号
                 _ = shutdown_rx.recv() => {
-                    debug!("UDP pool shutdown signal received");
+                    debug!("UDP 连接池收到关闭信号,正在关闭...");
                     break 'main_loop;
                 }
             }

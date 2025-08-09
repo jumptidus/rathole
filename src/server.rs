@@ -27,7 +27,7 @@ use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio::time::{self, error, timeout, Instant};
+use tokio::time::{self, timeout, Instant};
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
@@ -38,6 +38,7 @@ const UDP_POOL_SIZE: usize = 2; // UDP服务的缓存连接数
 const CHAN_SIZE: usize = 2048; // 通道的容量
 const DATA_CHANNEL_REQUEST_BUFFER: usize = CHAN_SIZE / 2; // 等待数据通道请求的缓冲区
 const HANDSHAKE_TIMEOUT: u64 = 5; // 握手超时时间(秒)
+const CONTROL_CHANNEL_WRITE_TIMEOUT: u64 = 5; // 控制通道写入超时(秒)
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -268,12 +269,12 @@ async fn handle_connection<T: 'static + Transport>(
     {
         Ok(Ok(hello)) => hello,
         Ok(Err(e)) => {
-            let _ = conn.shutdown().await;
+            let _ = timeout(Duration::from_secs(3), conn.shutdown()).await;
             error!("读取握手消息失败: {}, 显式关闭连接以防资源泄露", e);
             return Err(e);
         }
         Err(_) => {
-            let _ = conn.shutdown().await;
+            let _ = timeout(Duration::from_secs(3), conn.shutdown()).await;
             error!("握手超时, 显式关闭连接以防资源泄露");
             bail!("握手超时");
         }
@@ -292,12 +293,12 @@ async fn handle_connection<T: 'static + Transport>(
                     }
                     Ok(Err(e)) => {
                         error!("读取V2客户端时间戳失败: {}, 中断连接", e);
-                        let _ = conn.shutdown().await;
+                        let _ = timeout(Duration::from_secs(3), conn.shutdown()).await;
                         return Err(e.into());
                     }
                     Err(_) => {
                         error!("读取V2客户端时间戳超时, 中断连接");
-                        let _ = conn.shutdown().await;
+                        let _ = timeout(Duration::from_secs(3), conn.shutdown()).await;
                         bail!("读取时间戳超时");
                     }
                 }
@@ -738,36 +739,31 @@ impl<T: Transport> ControlChannel<T> {
         // Send Ack::Ok as the first action
         match self.write_and_flush(&bincode::serialize(&Ack::Ok)?).await {
             Ok(_) => {
-                info!("Control channel established and acknowledged.");
+                info!("控制通道建立成功并已确认");
             }
             Err(e) => {
-                error!(
-                    "Failed to send Ack::Ok to client, closing control channel: {:#}",
-                    e
-                );
+                error!("发送 Ack::Ok 失败, 关闭控制通道: {:#}", e);
                 return Err(e);
             }
         }
 
-        // Request initial data channels to fill the pool
+        // 发送初始数据通道请求...
         debug!(
             pool_size = self.pool_size,
-            "Sending initial data channel requests..."
+            "发送初始数据通道请求..., 池大小: {}", self.pool_size
         );
         for i in 0..self.pool_size {
             if let Err(e) = self.data_ch_req_tx.send(true).await {
-                // If the receiver is dropped (channel closed), we can't proceed.
-                error!("Failed to send initial data channel request #{}/{}: {}, control channel closing", i + 1, self.pool_size, e);
-                return Err(anyhow!(
-                    "Data channel request queue closed unexpectedly during init: {}",
+                error!(
+                    "发送初始数据通道请求失败 #{}/{}: {}, 控制通道关闭",
+                    i + 1,
+                    self.pool_size,
                     e
-                ));
+                );
+                return Err(anyhow!("数据通道请求队列在初始化期间意外关闭: {}", e));
             }
         }
-        debug!(
-            "Sent initial {} data channel requests successfully.",
-            self.pool_size
-        );
+        debug!("发送初始数据通道请求成功, 数量: {}", self.pool_size);
 
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel)?;
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat)?;
@@ -777,9 +773,17 @@ impl<T: Transport> ControlChannel<T> {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
-                                error!("{:#}", e);
-                                break;
+                            let write_future = self.write_and_flush(&create_ch_cmd);
+                            match time::timeout(Duration::from_secs(CONTROL_CHANNEL_WRITE_TIMEOUT), write_future).await {
+                                Ok(Ok(_)) => {}, // 写入成功
+                                Ok(Err(e)) => {
+                                    error!("写入 创建数据通道 失败: {:#}", e);
+                                    break;
+                                }
+                                Err(_) => {
+                                    error!("写入 创建数据通道 超时");
+                                    break;
+                                }
                             }
                         }
                         None => {
@@ -788,10 +792,18 @@ impl<T: Transport> ControlChannel<T> {
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.write_and_flush(&heartbeat).await {
-                                error!("{:#}", e);
-                                break;
-                            }
+                    let write_future = self.write_and_flush(&heartbeat);
+                    match time::timeout(Duration::from_secs(CONTROL_CHANNEL_WRITE_TIMEOUT), write_future).await {
+                        Ok(Ok(_)) => {}, // 写入成功
+                        Ok(Err(e)) => {
+                            error!("写入心跳失败: {:#}", e);
+                            break;
+                        }
+                        Err(_) => {
+                            error!("写入心跳超时");
+                            break;
+                        }
+                    }
                 }
                 _ = self.shutdown_rx.recv() => {
                     break;
@@ -799,7 +811,7 @@ impl<T: Transport> ControlChannel<T> {
             }
         }
 
-        info!("Control channel shutdown");
+        info!("控制通道关闭");
 
         Ok(())
     }
@@ -973,7 +985,7 @@ async fn run_udp_connection_pool<T: Transport>(
                         continue;
                     }
                     Err(_) => {
-                        error!("发送开始传输命令超时,数据通道可能已suai,请求新通道.");
+                        error!("发送开始传输命令超时,数据通道可能已损坏,请求新通道.");
                         // 请求新连接
                         if let Err(e) = data_ch_req_tx.send(true).await {
                             error!("请求新数据通道失败: {},控制通道可能已关闭.", e);

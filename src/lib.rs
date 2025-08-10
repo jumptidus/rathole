@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod config_watcher;
 mod constants;
+mod health;
 mod helper;
 mod multi_map;
 mod protocol;

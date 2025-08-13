@@ -8,8 +8,8 @@ use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
 // 默认探测参数
-pub const HEALTH_PROBE_DEFAULT_INTERVAL_SECS: u64 = 30; // 探测间隔
-pub const HEALTH_PROBE_DEFAULT_TIMEOUT_SECS: u64 = 6; // 单次探测超时
+pub const HEALTH_PROBE_DEFAULT_INTERVAL_SECS: u64 = 20; // 探测间隔
+pub const HEALTH_PROBE_DEFAULT_TIMEOUT_SECS: u64 = 5; // 单次探测超时
 pub const HEALTH_PROBE_DEFAULT_MAX_FAILURES: u32 = 3; // 最大连续失败次数
 
 // 默认探测目标
@@ -18,7 +18,7 @@ pub const HEALTH_PROBE_DEFAULT_DNS_SERVERS: &[&str] = &[
     "8.8.8.8:53",         // Google
     "114.114.114.114:53", // OpenDNS
 ];
-pub const HEALTH_PROBE_DEFAULT_DNS_QUERY: &str = "example.com";
+pub const HEALTH_PROBE_DEFAULT_DNS_QUERY: &str = "www.baidu.com";
 
 /// 健康探测配置
 #[derive(Clone, Debug)]

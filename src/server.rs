@@ -238,17 +238,24 @@ impl<T: 'static + Transport> Server<T> {
                     let _ = wg.insert(hash, cfg);
 
                     let mut wg = self.control_channels.write().await;
-                    let _ = wg.remove1(&hash);
+                    if let Some(handle) = wg.remove1(&hash) {
+                        handle.shutdown();
+                    }
                 }
                 ServerServiceChange::Delete(s) => {
                     let hash = protocol::digest(s.as_bytes());
                     let _ = self.services.write().await.remove(&hash);
 
                     let mut wg = self.control_channels.write().await;
-                    let _ = wg.remove1(&hash);
+                    if let Some(handle) = wg.remove1(&hash) {
+                        handle.shutdown();
+                    }
                 }
             },
-            ignored => warn!("Ignored {:?} since running as a server", ignored),
+            ignored => warn!(
+                "[预期之外的操作] 忽略 {:?} 因为运行着作为服务的服务器",
+                ignored
+            ),
         }
     }
 }
@@ -498,14 +505,18 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                     session_key = %hex::encode(session_key),
                     "替换旧通道, 创建新控制通道"
                 );
-                let _ = control_map_guard.remove1(&service_digest);
+                if let Some(old) = control_map_guard.remove1(&service_digest) {
+                    old.shutdown();
+                }
             } else if control_map_guard.get2(&session_key).is_some() {
                 warn!(
                     service = %service_name,
                     session_key = %hex::encode(session_key),
                     "检测到潜在的会话密钥冲突, 移除旧条目"
                 );
-                let _ = control_map_guard.remove2(&session_key);
+                if let Some(old) = control_map_guard.remove2(&session_key) {
+                    old.shutdown();
+                }
             }
 
             // 插入新句柄. `handle` 被移动到映射中
@@ -601,10 +612,11 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                         tokio::spawn(async move {
                             if let Some(map_arc) = control_channels_weak.upgrade() {
                                 let mut map = map_arc.write().await;
-                                if map.remove2(&session_key).is_some() {
+                                if let Some(handle) = map.remove2(&session_key) {
+                                    handle.shutdown();
                                     error!(
                                         service = %service_name,
-                                        "健康探测失败达到阈值，移除控制通道，等待客户端重连"
+                                        "健康探测失败达到阈值，已关闭并移除控制通道，等待客户端重连"
                                     );
                                 }
                             }
@@ -762,6 +774,12 @@ where
 
         // 创建控制通道句柄实例（返回给调用者）
         (handle, control_task_future)
+    }
+
+    /// Gracefully shutdown the control channel and its pools.
+    pub fn shutdown(&self) {
+        // Broadcast shutdown; ignore error if there are no active subscribers
+        let _ = self._shutdown_tx.send(true);
     }
 }
 

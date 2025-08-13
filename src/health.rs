@@ -11,6 +11,7 @@ use tracing::{debug, trace, warn};
 pub const HEALTH_PROBE_DEFAULT_INTERVAL_SECS: u64 = 20; // 探测间隔
 pub const HEALTH_PROBE_DEFAULT_TIMEOUT_SECS: u64 = 5; // 单次探测超时
 pub const HEALTH_PROBE_DEFAULT_MAX_FAILURES: u32 = 3; // 最大连续失败次数
+pub const HEALTH_PROBE_QUICK_RETRY_COUNT: u32 = 3; // 失败后快速探测次数（保持原有超时时间）
 
 // 默认探测目标
 pub const HEALTH_PROBE_DEFAULT_TCP_HOSTS: &[&str] = &["www.bing.com", "www.baidu.com"];
@@ -371,6 +372,39 @@ pub async fn run_health_probe_task(
                     );
                     on_failure();
                     break;
+                }
+
+                // 失败后进行快速探测（保持原有超时时间），失败会累计错误次数
+                'quick: for _ in 0..HEALTH_PROBE_QUICK_RETRY_COUNT {
+                    let quick_result = if is_tcp {
+                        tcp_health_probe_with_retry(&bind_addr, &config).await
+                    } else {
+                        udp_health_probe_with_retry(&bind_addr, &config).await
+                    };
+
+                    match quick_result {
+                        Ok(()) => {
+                            debug!("服务 {} 快速探测成功，恢复正常探测间隔", service_name);
+                            consecutive_failures = 0;
+                            // 成功后立即恢复正常节奏（进入下一轮常规 sleep）
+                            break 'quick;
+                        }
+                        Err(err) => {
+                            consecutive_failures += 1;
+                            warn!(
+                                "服务 {} 快速探测失败 ({}/{}): {}",
+                                service_name, consecutive_failures, config.max_failures, err
+                            );
+                            if consecutive_failures >= config.max_failures {
+                                warn!(
+                                    "服务 {} 健康探测连续失败 {} 次（包含快速探测），触发失败处理",
+                                    service_name, consecutive_failures
+                                );
+                                on_failure();
+                                return; // 直接退出任务
+                            }
+                        }
+                    }
                 }
             }
         }

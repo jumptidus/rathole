@@ -1,11 +1,7 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::health::{
-    tcp_socks5_http_probe_once, udp_socks5_dns_probe_once, HEALTH_PROBE_DEFAULT_HOST,
-    HEALTH_PROBE_DEFAULT_INTERVAL_SECS, HEALTH_PROBE_DEFAULT_TIMEOUT_SECS,
-    HEALTH_PROBE_DEFAULT_URL,
-};
+use crate::health::{run_health_probe_task, HealthProbeConfig};
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
@@ -44,11 +40,6 @@ const CHAN_SIZE: usize = 2048; // 通道的容量
 const DATA_CHANNEL_REQUEST_BUFFER: usize = CHAN_SIZE / 2; // 等待数据通道请求的缓冲区
 const HANDSHAKE_TIMEOUT: u64 = 5; // 握手超时时间(秒)
 const CONTROL_CHANNEL_WRITE_TIMEOUT: u64 = 5; // 控制通道写入超时(秒)
-                                              // 健康探测默认参数（如需覆盖，可后续做成配置项）
-const HEALTH_PROBE_INTERVAL_SECS: u64 = HEALTH_PROBE_DEFAULT_INTERVAL_SECS;
-const HEALTH_PROBE_TIMEOUT_SECS: u64 = HEALTH_PROBE_DEFAULT_TIMEOUT_SECS;
-const DNS_IP: [u8; 4] = [114, 114, 114, 114];
-const DNS_PORT: u16 = 53;
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -444,7 +435,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                     new_addr = %addr,
                     "找到一个相同的通道"
                 );
-                if existing.timestamp >= timestamp {
+                if existing.timestamp > timestamp {
                     info!(
                         service = %service_name,
                         old_ts = existing.timestamp,
@@ -578,83 +569,50 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             .instrument(info_span!("cleanup_task", session_key = %hex::encode(session_key_for_cleanup))),
         );
 
-        // 启动健康探测任务（按服务类型）
+        // 启动健康探测任务
         {
             let control_channels_weak_for_probe = control_channels_weak.clone();
             let session_key_for_probe = session_key_for_cleanup;
-            let service_name_for_probe_log = service_name.clone();
-            let service_name_for_probe_span = service_name.clone();
+            let service_name_for_probe = service_name.clone();
             let bind_addr_for_probe = service_config.bind_addr.clone();
+            let is_tcp = matches!(service_config.service_type, ServiceType::Tcp);
 
-            match service_config.service_type {
-                ServiceType::Tcp => {
-                    tokio::spawn(
-                        async move {
-                            let interval = Duration::from_secs(HEALTH_PROBE_INTERVAL_SECS);
-                            loop {
-                                time::sleep(interval).await;
-                                match tcp_socks5_http_probe_once(
-                                    &bind_addr_for_probe,
-                                    HEALTH_PROBE_DEFAULT_HOST,
-                                    HEALTH_PROBE_DEFAULT_URL,
-                                    HEALTH_PROBE_TIMEOUT_SECS,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        debug!(service = %service_name_for_probe_log, "TCP 健康探测成功");
-                                    }
-                                    Err(e) => {
-                                        warn!(service = %service_name_for_probe_log, "TCP 健康探测失败: {:#}", e);
-                                        if let Some(map_arc) = control_channels_weak_for_probe.upgrade() {
-                                            let mut map = map_arc.write().await;
-                                            if map.remove2(&session_key_for_probe).is_some() {
-                                                error!(service = %service_name_for_probe_log, "健康探测失败，移除控制通道，等待客户端重连");
-                                            }
-                                        }
-                                        break;
-                                    }
+            // 使用默认配置，后续可以从服务配置中读取
+            let probe_config = HealthProbeConfig::default();
+
+            let probe_span = if is_tcp {
+                info_span!("health_probe", service = %service_name_for_probe, proto = "TCP")
+            } else {
+                info_span!("health_probe", service = %service_name_for_probe, proto = "UDP")
+            };
+
+            tokio::spawn(
+                run_health_probe_task(
+                    service_name_for_probe.clone(),
+                    bind_addr_for_probe,
+                    probe_config,
+                    is_tcp,
+                    move || {
+                        // 失败处理闭包
+                        let control_channels_weak = control_channels_weak_for_probe.clone();
+                        let session_key = session_key_for_probe;
+                        let service_name = service_name_for_probe.clone();
+
+                        tokio::spawn(async move {
+                            if let Some(map_arc) = control_channels_weak.upgrade() {
+                                let mut map = map_arc.write().await;
+                                if map.remove2(&session_key).is_some() {
+                                    error!(
+                                        service = %service_name,
+                                        "健康探测失败达到阈值，移除控制通道，等待客户端重连"
+                                    );
                                 }
                             }
-                        }
-                        .instrument(info_span!("tcp_health_probe", service = %service_name_for_probe_span)),
-                    );
-                }
-                ServiceType::Udp => {
-                    tokio::spawn(
-                        async move {
-                            let interval = Duration::from_secs(HEALTH_PROBE_INTERVAL_SECS);
-                            loop {
-                                time::sleep(interval).await;
-                                match udp_socks5_dns_probe_once(
-                                    &bind_addr_for_probe,
-                                    DNS_IP,
-                                    DNS_PORT,
-                                    HEALTH_PROBE_DEFAULT_HOST,
-                                    HEALTH_PROBE_TIMEOUT_SECS,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        debug!(service = %service_name_for_probe_log, "UDP 健康探测成功");
-                                    }
-                                    Err(e) => {
-                                        warn!(service = %service_name_for_probe_log, "UDP 健康探测失败: {:#}", e);
-                                        if let Some(map_arc) = control_channels_weak_for_probe.upgrade() {
-                                            let mut map = map_arc.write().await;
-                                            if map.remove2(&session_key_for_probe).is_some() {
-                                                error!(service = %service_name_for_probe_log, "健康探测失败，移除控制通道，等待客户端重连");
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        .instrument(info_span!("udp_health_probe", service = %service_name_for_probe_span)),
-                    );
-                }
-            }
+                        });
+                    },
+                )
+                .instrument(probe_span),
+            );
         }
     }
 

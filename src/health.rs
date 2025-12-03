@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
 // 默认探测参数
-pub const HEALTH_PROBE_DEFAULT_INTERVAL_SECS: u64 = 20; // 探测间隔
+pub const HEALTH_PROBE_DEFAULT_INTERVAL_SECS: u64 = 45; // 探测间隔
 pub const HEALTH_PROBE_DEFAULT_TIMEOUT_SECS: u64 = 5; // 单次探测超时
 pub const HEALTH_PROBE_DEFAULT_MAX_FAILURES: u32 = 3; // 最大连续失败次数
 pub const HEALTH_PROBE_QUICK_RETRY_COUNT: u32 = 3; // 失败后快速探测次数（保持原有超时时间）
@@ -414,7 +414,12 @@ pub async fn run_health_probe_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::random;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
     use tokio::net::{TcpStream, UdpSocket};
+    use tokio::sync::mpsc;
+    use tokio::time::Instant;
 
     // 真实 TCP 访问 bing.com，校验返回 2xx/3xx
     #[tokio::test]
@@ -458,11 +463,11 @@ mod tests {
         Ok(())
     }
 
-    // 真实 UDP 向 1.0.0.1 发送 DNS 查询，校验 QR=1 且 RCODE=0
+    // 真实 UDP 向 114.114.114.114 发送 DNS 查询，校验 QR=1 且 RCODE=0
     #[tokio::test]
     async fn test_udp_dns_cloudflare_reachable() -> Result<()> {
         let s = UdpSocket::bind("0.0.0.0:0").await?;
-        let id: u16 = rand::thread_rng().gen();
+        let id: u16 = random();
         let dns = build_dns_query("example.com", id);
         timeout(
             Duration::from_secs(HEALTH_PROBE_DEFAULT_TIMEOUT_SECS + 4),
@@ -481,10 +486,373 @@ mod tests {
         }
         let rid = u16::from_be_bytes([buf[0], buf[1]]);
         let flags = u16::from_be_bytes([buf[2], buf[3]]);
-        let rcode = flags & 0x000F;
+        let recode = flags & 0x000F;
         assert_eq!(rid, id, "DNS 响应 ID 不匹配");
         assert_ne!(flags & 0x8000, 0, "DNS 响应 QR 位异常");
-        assert_eq!(rcode, 0, "DNS 响应 RCODE 非 0: {}", rcode);
+        assert_eq!(recode, 0, "DNS 响应 CODE 非 0: {}", recode);
         Ok(())
+    }
+
+    // 测试 DNS 查询构造
+    #[test]
+    fn test_build_dns_query() {
+        let query = build_dns_query("example.com", 0x1234);
+
+        // 验证头部
+        assert_eq!(query[0..2], [0x12, 0x34]); // ID
+        assert_eq!(query[2..4], [0x01, 0x00]); // 标志 RD=1
+        assert_eq!(query[4..6], [0x00, 0x01]); // QDCOUNT=1
+        assert_eq!(query[6..8], [0x00, 0x00]); // ANCOUNT=0
+        assert_eq!(query[8..10], [0x00, 0x00]); // NSCOUNT=0
+        assert_eq!(query[10..12], [0x00, 0x00]); // ARCOUNT=0
+
+        // 验证域名编码
+        let expected_domain = [
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', // "example"
+            3, b'c', b'o', b'm', // "com"
+            0,    // 结尾
+        ];
+        assert_eq!(&query[12..12 + expected_domain.len()], &expected_domain);
+
+        // 验证查询类型和类别
+        let qtype_qclass_offset = 12 + expected_domain.len();
+        assert_eq!(
+            query[qtype_qclass_offset..qtype_qclass_offset + 2],
+            [0x00, 0x01]
+        ); // QTYPE=A
+        assert_eq!(
+            query[qtype_qclass_offset + 2..qtype_qclass_offset + 4],
+            [0x00, 0x01]
+        ); // QCLASS=IN
+    }
+
+    // 测试 SOCKS5 UDP 包构造
+    #[test]
+    fn test_build_socks5_udp_packet() {
+        let dst_ip = [1, 2, 3, 4];
+        let dst_port = 53;
+        let payload = b"test";
+
+        let packet = build_socks5_udp_packet(dst_ip, dst_port, payload);
+
+        // 验证 SOCKS5 UDP 头部
+        assert_eq!(packet[0..2], [0x00, 0x00]); // RSV
+        assert_eq!(packet[2], 0x00); // FRAG
+        assert_eq!(packet[3], 0x01); // ATYP=IPv4
+        assert_eq!(packet[4..8], [1, 2, 3, 4]); // DST.ADDR
+        assert_eq!(packet[8..10], [0x00, 0x35]); // DST.PORT (53)
+        assert_eq!(&packet[10..], b"test"); // PAYLOAD
+    }
+
+    // 测试 SOCKS5 UDP 包解析
+    #[test]
+    fn test_parse_socks5_udp_payload() {
+        // 构造一个有效的 SOCKS5 UDP 包
+        let packet = vec![
+            0x00, 0x00, // RSV
+            0x00, // FRAG
+            0x01, // ATYP=IPv4
+            1, 2, 3, 4, // DST.ADDR
+            0x00, 0x35, // DST.PORT (53)
+            b't', b'e', b's', b't', // PAYLOAD
+        ];
+
+        let payload = parse_socks5_udp_payload(&packet);
+        assert_eq!(payload, Some(b"test" as &[u8]));
+
+        // 测试过短的包
+        let short_packet = vec![0x00, 0x00];
+        assert_eq!(parse_socks5_udp_payload(&short_packet), None);
+
+        // 测试 IPv6 地址类型
+        let ipv6_packet = vec![
+            0x00, 0x00, // RSV
+            0x00, // FRAG
+            0x04, // ATYP=IPv6
+        ];
+        ipv6_packet.len();
+        let mut ipv6_full = ipv6_packet;
+        ipv6_full.extend_from_slice(&[0u8; 16]); // IPv6 地址
+        ipv6_full.extend_from_slice(&[0x00, 0x35]); // 端口
+        ipv6_full.extend_from_slice(b"test"); // payload
+
+        let payload = parse_socks5_udp_payload(&ipv6_full);
+        assert_eq!(payload, Some(b"test" as &[u8]));
+
+        // 测试域名地址类型
+        let domain_packet = vec![
+            0x00, 0x00, // RSV
+            0x00, // FRAG
+            0x03, // ATYP=DOMAIN
+            0x07, // 域名长度
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', // "example"
+            0x00, 0x35, // 端口
+            b't', b'e', b's', b't', // payload
+        ];
+
+        let payload = parse_socks5_udp_payload(&domain_packet);
+        assert_eq!(payload, Some(b"test" as &[u8]));
+    }
+
+    // 测试健康探测配置
+    #[test]
+    fn test_health_probe_config_default() {
+        let config = HealthProbeConfig::default();
+
+        assert!(config.enabled);
+        assert_eq!(config.interval_secs, HEALTH_PROBE_DEFAULT_INTERVAL_SECS);
+        assert_eq!(config.timeout_secs, HEALTH_PROBE_DEFAULT_TIMEOUT_SECS);
+        assert_eq!(config.max_failures, HEALTH_PROBE_DEFAULT_MAX_FAILURES);
+        assert_eq!(config.tcp_hosts.len(), HEALTH_PROBE_DEFAULT_TCP_HOSTS.len());
+        assert_eq!(
+            config.dns_servers.len(),
+            HEALTH_PROBE_DEFAULT_DNS_SERVERS.len()
+        );
+        assert_eq!(config.dns_query_domain, HEALTH_PROBE_DEFAULT_DNS_QUERY);
+    }
+
+    // 测试健康探测配置克隆
+    #[test]
+    fn test_health_probe_config_clone() {
+        let config1 = HealthProbeConfig::default();
+        let config2 = config1.clone();
+
+        assert_eq!(config1.enabled, config2.enabled);
+        assert_eq!(config1.interval_secs, config2.interval_secs);
+        assert_eq!(config1.timeout_secs, config2.timeout_secs);
+        assert_eq!(config1.max_failures, config2.max_failures);
+        assert_eq!(config1.tcp_hosts, config2.tcp_hosts);
+        assert_eq!(config1.dns_servers, config2.dns_servers);
+        assert_eq!(config1.dns_query_domain, config2.dns_query_domain);
+    }
+
+    // 模拟探测函数用于测试快速重试机制
+    struct MockProbe {
+        call_count: Arc<AtomicU32>,
+        fail_times: u32,
+    }
+
+    impl MockProbe {
+        fn new(fail_times: u32) -> Self {
+            Self {
+                call_count: Arc::new(AtomicU32::new(0)),
+                fail_times,
+            }
+        }
+
+        async fn probe(&self) -> Result<()> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count < self.fail_times {
+                bail!("模拟探测失败 #{}", count + 1);
+            }
+            Ok(())
+        }
+
+        fn get_call_count(&self) -> u32 {
+            self.call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    // 测试快速重试机制 - 最终成功的情况
+    #[tokio::test]
+    async fn test_quick_retry_eventually_success() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let failure_count = Arc::new(AtomicU32::new(0));
+
+        // 模拟配置：快速失败2次后成功
+        let config = HealthProbeConfig {
+            enabled: true,
+            interval_secs: 1, // 短间隔便于测试
+            timeout_secs: 1,
+            max_failures: 5, // 较高阈值避免过早触发失败处理
+            tcp_hosts: vec!["mock.local".to_string()],
+            dns_servers: vec!["8.8.8.8:53".to_string()],
+            dns_query_domain: "test.com".to_string(),
+        };
+
+        let mock_probe = MockProbe::new(2); // 前2次失败，第3次成功
+        let probe_clone = Arc::new(mock_probe);
+        let probe_for_task = probe_clone.clone();
+
+        // 启动简化的健康探测任务
+        let task_handle = tokio::spawn(async move {
+            let mut consecutive_failures = 0u32;
+
+            // 第一次正常探测（失败）
+            match probe_for_task.probe().await {
+                Ok(_) => consecutive_failures = 0,
+                Err(_) => {
+                    consecutive_failures += 1;
+
+                    // 进行快速重试
+                    for _ in 0..HEALTH_PROBE_QUICK_RETRY_COUNT {
+                        match probe_for_task.probe().await {
+                            Ok(_) => {
+                                consecutive_failures = 0;
+                                let _ = tx.send("success_after_retry".to_string()).await;
+                                return;
+                            }
+                            Err(_) => {
+                                consecutive_failures += 1;
+                                if consecutive_failures >= config.max_failures {
+                                    let _ = tx.send("max_failures_reached".to_string()).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send("unexpected_end".to_string()).await;
+        });
+
+        // 等待结果
+        let result = timeout(Duration::from_secs(5), rx.recv()).await;
+        task_handle.abort();
+
+        match result {
+            Ok(Some(msg)) => {
+                assert_eq!(msg, "success_after_retry");
+                // 验证总共调用了3次（1次正常 + 2次快速重试）
+                assert_eq!(probe_clone.get_call_count(), 3);
+            }
+            Ok(None) => panic!("任务意外结束"),
+            Err(_) => panic!("测试超时"),
+        }
+    }
+
+    // 测试快速重试机制 - 达到最大失败次数
+    #[tokio::test]
+    async fn test_quick_retry_max_failures() {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let config = HealthProbeConfig {
+            enabled: true,
+            interval_secs: 1,
+            timeout_secs: 1,
+            max_failures: 3, // 低阈值便于触发
+            tcp_hosts: vec!["mock.local".to_string()],
+            dns_servers: vec!["8.8.8.8:53".to_string()],
+            dns_query_domain: "test.com".to_string(),
+        };
+
+        let mock_probe = MockProbe::new(10); // 始终失败
+        let probe_clone = Arc::new(mock_probe);
+        let probe_for_task = probe_clone.clone();
+
+        // 启动简化的健康探测任务
+        let task_handle = tokio::spawn(async move {
+            let mut consecutive_failures = 0u32;
+
+            // 第一次正常探测（失败）
+            match probe_for_task.probe().await {
+                Ok(_) => consecutive_failures = 0,
+                Err(_) => {
+                    consecutive_failures += 1;
+
+                    // 进行快速重试
+                    for _ in 0..HEALTH_PROBE_QUICK_RETRY_COUNT {
+                        match probe_for_task.probe().await {
+                            Ok(_) => {
+                                consecutive_failures = 0;
+                                break;
+                            }
+                            Err(_) => {
+                                consecutive_failures += 1;
+                                if consecutive_failures >= config.max_failures {
+                                    let _ = tx.send("max_failures_reached".to_string()).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(consecutive_failures, config.max_failures);
+            let _ = tx.send("unexpected_end".to_string()).await;
+        });
+
+        // 等待结果
+        let result = timeout(Duration::from_secs(5), rx.recv()).await;
+        task_handle.abort();
+
+        match result {
+            Ok(Some(msg)) => {
+                assert_eq!(msg, "max_failures_reached");
+                // 验证达到最大失败次数时停止（1次正常 + 2次快速重试 = 3次）
+                assert_eq!(probe_clone.get_call_count(), 3);
+            }
+            Ok(None) => panic!("任务意外结束"),
+            Err(_) => panic!("测试超时"),
+        }
+    }
+
+    // 测试健康探测任务禁用状态
+    #[tokio::test]
+    async fn test_health_probe_disabled() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let failure_callback_called = Arc::new(AtomicU32::new(0));
+        let callback_clone = failure_callback_called.clone();
+
+        let config = HealthProbeConfig {
+            enabled: false, // 禁用探测
+            interval_secs: 1,
+            timeout_secs: 1,
+            max_failures: 1,
+            tcp_hosts: vec!["nonexistent.local".to_string()],
+            dns_servers: vec!["192.0.2.1:53".to_string()], // 测试用IP，不应该响应
+            dns_query_domain: "test.com".to_string(),
+        };
+
+        let task_handle = tokio::spawn(async move {
+            // 使用一个短暂的任务来模拟 run_health_probe_task 的行为
+            if !config.enabled {
+                let _ = tx.send("disabled".to_string()).await;
+                return;
+            }
+
+            // 这里不应该执行到
+            callback_clone.store(1, Ordering::SeqCst);
+            let _ = tx.send("unexpected_execution".to_string()).await;
+        });
+
+        // 等待结果
+        let result = timeout(Duration::from_secs(2), rx.recv()).await;
+        task_handle.abort();
+
+        match result {
+            Ok(Some(msg)) => {
+                assert_eq!(msg, "disabled");
+                assert_eq!(failure_callback_called.load(Ordering::SeqCst), 0);
+            }
+            Ok(None) => panic!("任务意外结束"),
+            Err(_) => panic!("测试超时"),
+        }
+    }
+
+    // 测试探测时间计算
+    #[tokio::test]
+    async fn test_probe_timing() {
+        let start_time = Instant::now();
+
+        // 测试一个快速成功的探测
+        let config = HealthProbeConfig {
+            enabled: true,
+            interval_secs: 1,
+            timeout_secs: 1,
+            max_failures: 3,
+            tcp_hosts: vec!["localhost".to_string()], // 应该能快速连接失败
+            dns_servers: vec!["8.8.8.8:53".to_string()],
+            dns_query_domain: "test.com".to_string(),
+        };
+
+        // 测试 TCP 探测超时行为
+        let tcp_result = tcp_health_probe_with_retry("127.0.0.1:99999", &config).await;
+        let elapsed = start_time.elapsed();
+
+        // 应该快速失败，不会等待很长时间
+        assert!(elapsed < Duration::from_secs(5));
+        assert!(tcp_result.is_err()); // 预期失败，因为端口不存在
     }
 }

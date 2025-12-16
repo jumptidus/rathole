@@ -1,3 +1,12 @@
 /target
 perf.data
 perf.data.old
+docs/logs
+releases
+
+# IDE
+.idea/
+.cursorrules
+
+# GitHub workflows (intentionally removed)
+.github/

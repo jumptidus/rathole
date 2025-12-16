@@ -93,18 +93,19 @@ pub async fn tcp_socks5_http_probe_once(
     if head[1] != 0x00 {
         bail!("TCP 健康探测: SOCKS5 CONNECT 失败: REP={:#x}", head[1]);
     }
-    // 丢弃 BND.ADDR + BND.PORT
-    let addr_len = match head[3] {
-        0x01 => 4,
-        0x04 => 16,
+    // 丢弃 BND.ADDR + BND.PORT（已读过域名长度，仅读取域名本身与端口）
+    let addr_and_port_len = match head[3] {
+        0x01 => 4 + 2,
+        0x04 => 16 + 2,
         0x03 => {
             let mut l = [0u8; 1];
             timeout(Duration::from_secs(timeout_secs), s.read_exact(&mut l)).await??;
-            l[0] as usize
+            let domain_len = l[0] as usize;
+            domain_len + 2
         }
         _ => bail!("TCP 健康探测: 非法 ATYP"),
     };
-    let mut discard = vec![0u8; addr_len + 2];
+    let mut discard = vec![0u8; addr_and_port_len];
     timeout(
         Duration::from_secs(timeout_secs),
         s.read_exact(&mut discard),

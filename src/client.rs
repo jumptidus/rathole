@@ -340,7 +340,7 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
 async fn run_udp_forwarder(
     s: UdpSocket,
     mut inbound_rx: mpsc::Receiver<Bytes>,
-    outbount_tx: mpsc::Sender<UdpTraffic>,
+    outbound_tx: mpsc::Sender<UdpTraffic>,
     from: SocketAddr,
     port_map: UdpPortMap,
 ) -> Result<()> {
@@ -371,7 +371,7 @@ async fn run_udp_forwarder(
                     data: Bytes::copy_from_slice(&buf[..len])
                 };
 
-                outbount_tx.send(t).await?;
+                outbound_tx.send(t).await?;
             },
 
             // No traffic for the duration of UDP_TIMEOUT, clean up the state

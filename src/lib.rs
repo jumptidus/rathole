@@ -163,6 +163,7 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
     }
 }
 
+/// 仅支持 Client 模式
 pub async fn run_from_str(
     config_str: &str,
     shutdown_rx: broadcast::Receiver<bool>,

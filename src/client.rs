@@ -1,5 +1,6 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
+use crate::data_channel_limit::get_data_channel_limiter;
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
@@ -482,11 +483,35 @@ impl<T: 'static + Transport> ControlChannel<T> {
                     match val {
                         ControlChannelCmd::CreateDataChannel => {
                             let args = data_ch_args.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = run_data_channel(args).await.with_context(|| "Failed to run the data channel") {
-                                    warn!("{:#}", e);
+                            if let Some(limiter) = get_data_channel_limiter(&self.service.name) {
+                                if let Some(permit) = limiter.try_acquire() {
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        if let Err(e) = run_data_channel(args)
+                                            .await
+                                            .with_context(|| "数据通道运行失败")
+                                        {
+                                            warn!("{:#}", e);
+                                        }
+                                    }
+                                    .instrument(Span::current()));
+                                } else {
+                                    warn!(
+                                        "数据通道已达到上限, 已拒绝创建: {}",
+                                        self.service.name
+                                    );
                                 }
-                            }.instrument(Span::current()));
+                            } else {
+                                tokio::spawn(async move {
+                                    if let Err(e) = run_data_channel(args)
+                                        .await
+                                        .with_context(|| "数据通道运行失败")
+                                    {
+                                        warn!("{:#}", e);
+                                    }
+                                }
+                                .instrument(Span::current()));
+                            }
                         },
                         ControlChannelCmd::HeartBeat => ()
                     }

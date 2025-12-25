@@ -61,13 +61,10 @@ pub fn register_data_channel_limiter(
     service_name: &str,
     limiter: Arc<DataChannelLimiter>,
 ) -> Arc<DataChannelLimiter> {
-    let mut registry = match REGISTRY.write() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            error!("数据通道注册表写锁已被 poison，继续使用已持有的锁");
-            poisoned.into_inner()
-        }
-    };
+    let mut registry = REGISTRY.write().unwrap_or_else(|poisoned| {
+        error!("数据通道注册表写锁已被 poison，继续使用已持有的锁");
+        poisoned.into_inner()
+    });
     if let Some(existing) = registry.get(service_name) {
         return Arc::clone(existing);
     }
@@ -76,23 +73,17 @@ pub fn register_data_channel_limiter(
 }
 
 pub fn unregister_data_channel_limiter(service_name: &str) -> Option<Arc<DataChannelLimiter>> {
-    let mut registry = match REGISTRY.write() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            error!("数据通道注册表写锁已被 poison，继续使用已持有的锁");
-            poisoned.into_inner()
-        }
-    };
+    let mut registry = REGISTRY.write().unwrap_or_else(|poisoned| {
+        error!("数据通道注册表写锁已被 poison，继续使用已持有的锁");
+        poisoned.into_inner()
+    });
     registry.remove(service_name)
 }
 
 pub(crate) fn get_data_channel_limiter(service_name: &str) -> Option<Arc<DataChannelLimiter>> {
-    let registry = match REGISTRY.read() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            error!("数据通道注册表读锁已被 poison，继续使用已持有的锁");
-            poisoned.into_inner()
-        }
-    };
+    let registry = REGISTRY.read().unwrap_or_else(|poisoned| {
+        error!("数据通道注册表读锁已被 poison，继续使用已持有的锁");
+        poisoned.into_inner()
+    });
     registry.get(service_name).cloned()
 }

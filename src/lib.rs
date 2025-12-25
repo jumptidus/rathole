@@ -2,6 +2,7 @@ mod cli;
 mod config;
 pub mod config_watcher;
 mod constants;
+mod data_channel_handler;
 mod data_channel_limit;
 mod helper;
 mod multi_map;
@@ -12,6 +13,10 @@ pub use cli::Cli;
 use cli::KeypairType;
 pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
+pub use data_channel_handler::{
+    register_data_channel_tcp_handler, unregister_data_channel_tcp_handler, AsyncReadWrite,
+    DataChannelTcpHandler,
+};
 pub use data_channel_limit::{
     register_data_channel_limiter, unregister_data_channel_limiter, DataChannelLimiter,
 };

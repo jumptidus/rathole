@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio::time;
 use tracing::{error, info, info_span, warn, Instrument};
 
@@ -152,6 +152,15 @@ impl<T: 'static + Transport> Server<T> {
             ..Default::default()
         };
 
+        let max_inflight_handshakes = self.config.max_inflight_handshakes;
+        let handshake_semaphore = if max_inflight_handshakes == 0 {
+            None
+        } else {
+            Some(Arc::new(Semaphore::new(
+                max_inflight_handshakes as usize,
+            )))
+        };
+
         let mut update_enabled = true;
 
         // Wait for connections and shutdown signals
@@ -184,12 +193,24 @@ impl<T: 'static + Transport> Server<T> {
                         Ok((conn, addr)) => {
                             backoff.reset();
 
+                            let permit = match handshake_semaphore.as_ref() {
+                                Some(sem) => match sem.clone().try_acquire_owned() {
+                                    Ok(permit) => Some(permit),
+                                    Err(_) => {
+                                        warn!(addr = %addr, "握手并发已达上限, 拒绝连接");
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
+
                             let transport = self.transport.clone();
                             let services = self.services.clone();
                             let control_channels = self.control_channels.clone();
                             let server_config = self.config.clone();
 
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), transport.handshake(conn)).await {
                                     Ok(conn_result) => {
                                         match conn_result.with_context(|| "握手失败") {

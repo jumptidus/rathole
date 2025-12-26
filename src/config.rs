@@ -13,6 +13,7 @@ use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAU
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 const DEFAULT_DATA_CHANNEL_WAIT_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_MAX_INFLIGHT_HANDSHAKES: u64 = 512;
 
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
@@ -219,6 +220,10 @@ fn default_data_channel_wait_timeout() -> u64 {
     DEFAULT_DATA_CHANNEL_WAIT_TIMEOUT_SECS
 }
 
+fn default_max_inflight_handshakes() -> u64 {
+    DEFAULT_MAX_INFLIGHT_HANDSHAKES
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -231,6 +236,8 @@ pub struct ServerConfig {
     pub heartbeat_interval: u64,
     #[serde(default = "default_data_channel_wait_timeout")]
     pub data_channel_wait_timeout: u64,
+    #[serde(default = "default_max_inflight_handshakes")]
+    pub max_inflight_handshakes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -272,6 +279,10 @@ impl Config {
         }
 
         Config::validate_transport_config(&server.transport, true)?;
+
+        if server.max_inflight_handshakes > usize::MAX as u64 {
+            bail!("server.max_inflight_handshakes is too large");
+        }
 
         Ok(())
     }

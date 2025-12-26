@@ -143,6 +143,7 @@ local_addr = "127.0.0.1:1082"
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+max_inflight_handshakes = 512 # Optional. Max number of in-flight handshakes. Set to 0 to disable the limit. Default: 512
 data_channel_wait_timeout = 5 # Optional. The timeout for waiting for a data channel when accepting a new visitor. Set to 0 to disable. Default: 5 seconds
 
 [server.transport] # Same as `[client.transport]`

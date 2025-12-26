@@ -25,7 +25,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::{self, timeout, Instant};
@@ -40,6 +40,14 @@ const CHAN_SIZE: usize = 2048; // 通道的容量
 const DATA_CHANNEL_REQUEST_BUFFER: usize = CHAN_SIZE / 2; // 等待数据通道请求的缓冲区
 const HANDSHAKE_TIMEOUT: u64 = 5; // 握手超时时间(秒)
 const CONTROL_CHANNEL_WRITE_TIMEOUT: u64 = 5; // 控制通道写入超时(秒)
+#[cfg(not(test))]
+const UDP_READ_TIMEOUT: Duration = Duration::from_secs(10); // UDP Read Timeout
+#[cfg(test)]
+const UDP_READ_TIMEOUT: Duration = Duration::from_millis(100); // 测试缩短
+#[cfg(not(test))]
+const UDP_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60 * 5); // 5分钟
+#[cfg(test)]
+const UDP_ACTIVITY_TIMEOUT: Duration = Duration::from_millis(300); // 测试缩短
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -336,6 +344,48 @@ async fn handle_connection<T: 'static + Transport>(
     Ok(())
 }
 
+async fn write_all_with_timeout<T>(
+    conn: &mut T,
+    data: &[u8],
+    label: &str,
+) -> Result<()>
+where
+    T: AsyncWrite + Unpin,
+{
+    match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), conn.write_all(data)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            error!("{}失败: {}", label, e);
+            Err(e.into())
+        }
+        Err(_) => {
+            error!("{}超时", label);
+            bail!("{}超时", label);
+        }
+    }
+}
+
+async fn write_and_flush_with_timeout<T>(
+    conn: &mut T,
+    data: &[u8],
+    label: &str,
+) -> Result<()>
+where
+    T: AsyncWrite + Unpin,
+{
+    match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), write_and_flush(conn, data)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            error!("{}失败: {:#}", label, e);
+            Err(e)
+        }
+        Err(_) => {
+            error!("{}超时", label);
+            bail!("{}超时", label);
+        }
+    }
+}
+
 async fn do_control_channel_handshake<T: 'static + Transport>(
     mut conn: T::Stream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
@@ -374,15 +424,19 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         },
         nonce_array,
     );
-    conn.write_all(&bincode::serialize(&hello_send)?).await?;
-    conn.flush().await?;
+    let hello_bytes = bincode::serialize(&hello_send)?;
+    write_and_flush_with_timeout(&mut conn, &hello_bytes, "发送握手消息").await?;
 
     // 查找服务
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist)?)
-                .await?;
+            write_all_with_timeout(
+                &mut conn,
+                &bincode::serialize(&Ack::ServiceNotExist)?,
+                "发送 Ack::ServiceNotExist",
+            )
+            .await?;
             bail!("未找到服务: {}", hex::encode(service_digest));
         }
     }
@@ -395,8 +449,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         Some(t) => t.as_bytes(),
         None => {
             error!(service = %service_name, "认证失败: 服务未配置token");
-            conn.write_all(&bincode::serialize(&Ack::AuthFailed)?)
-                .await?;
+            write_all_with_timeout(
+                &mut conn,
+                &bincode::serialize(&Ack::AuthFailed)?,
+                "发送 Ack::AuthFailed",
+            )
+            .await?;
             bail!("服务 {} 未配置token", service_name);
         }
     };
@@ -420,8 +478,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     // 验证
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed)?)
-            .await?;
+        write_all_with_timeout(
+            &mut conn,
+            &bincode::serialize(&Ack::AuthFailed)?,
+            "发送 Ack::AuthFailed",
+        )
+        .await?;
         debug!(
             "认证失败, 期望 {}, 实际 {}",
             hex::encode(session_key),
@@ -452,8 +514,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                         "拒绝连接: 旧时间戳:{} >= 新时间戳:{}",
                         existing.timestamp, timestamp
                     );
-                    conn.write_all(&bincode::serialize(&Ack::AuthFailed)?)
-                        .await?;
+                    write_all_with_timeout(
+                        &mut conn,
+                        &bincode::serialize(&Ack::AuthFailed)?,
+                        "发送 Ack::AuthFailed",
+                    )
+                    .await?;
                     return Ok(());
                 }
                 info!(
@@ -488,6 +554,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             timestamp,
             addr,
         );
+        let shutdown_rx_for_probe = handle._shutdown_tx.subscribe();
 
         let control_channels_weak = Arc::downgrade(&control_channels); // 弱引用控制通道句柄
         let control_channels_weak_for_cleanup = control_channels_weak.clone();
@@ -604,6 +671,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                     bind_addr_for_probe,
                     probe_config,
                     is_tcp,
+                    shutdown_rx_for_probe,
                     move || {
                         // 失败处理闭包
                         let control_channels_weak = control_channels_weak_for_probe.clone();
@@ -640,14 +708,21 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     debug!("Try to handshake a data channel");
 
     // Validate
-    let control_channels_guard = control_channels.read().await;
-    match control_channels_guard.get2(&nonce) {
-        Some(handle) => {
-            T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
+    let data_channel = {
+        let control_channels_guard = control_channels.read().await;
+        control_channels_guard.get2(&nonce).map(|handle| {
+            (
+                handle.data_ch_tx.clone(),
+                SocketOpts::from_server_cfg(&handle.service),
+            )
+        })
+    };
+    match data_channel {
+        Some((data_ch_tx, socket_opts)) => {
+            T::hint(&conn, socket_opts);
 
             // Send the data channel to the corresponding control channel
-            handle
-                .data_ch_tx
+            data_ch_tx
                 .send(conn)
                 .await
                 .with_context(|| "Data channel for a stale control channel")?;
@@ -1052,9 +1127,7 @@ async fn run_udp_connection_pool<T: Transport>(
     data_ch_req_tx: mpsc::Sender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    const UDP_READ_TIMEOUT: Duration = Duration::from_secs(10); // UDP Read Timeout
     const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10); // UDP Write Timeout
-    const UDP_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60 * 5); // 5分钟
 
     // 绑定UDP监听socket
     let l = retry_notify_with_deadline(
@@ -1072,7 +1145,6 @@ async fn run_udp_connection_pool<T: Transport>(
 
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp)?;
     let mut buf = [0u8; UDP_BUFFER_SIZE];
-    let mut last_activity = Instant::now();
 
     // 主循环：管理连接和数据转发
     'main_loop: loop {
@@ -1108,6 +1180,8 @@ async fn run_udp_connection_pool<T: Transport>(
                 break;
             }
         };
+
+        let mut last_activity = Instant::now();
 
         // 数据转发循环
         'data_loop: loop {
@@ -1221,4 +1295,146 @@ async fn run_udp_connection_pool<T: Transport>(
 
     debug!("UDP pool dropped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        do_data_channel_handshake, run_udp_connection_pool, ControlChannelHandle,
+        ControlChannelMap, ServerServiceConfig, SocketOpts, Transport, UDP_ACTIVITY_TIMEOUT,
+        UDP_READ_TIMEOUT, HASH_WIDTH_IN_BYTES, Result,
+    };
+    use async_trait::async_trait;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::duplex;
+    use tokio::net::ToSocketAddrs;
+    use tokio::sync::{broadcast, mpsc, RwLock};
+    use tokio::time::timeout;
+
+    use crate::config::TransportConfig;
+    use crate::transport::AddrMaybeCached;
+
+    #[derive(Debug)]
+    struct TestTransport;
+
+    #[async_trait]
+    impl Transport for TestTransport {
+        type Acceptor = ();
+        type RawStream = ();
+        type Stream = tokio::io::DuplexStream;
+
+        fn new(_config: &TransportConfig) -> Result<Self> {
+            unimplemented!("测试用: 不应调用");
+        }
+
+        fn hint(_conn: &Self::Stream, _opts: SocketOpts) {}
+
+        async fn bind<T: ToSocketAddrs + Send + Sync>(&self, _addr: T) -> Result<Self::Acceptor> {
+            unimplemented!("测试用: 不应调用");
+        }
+
+        async fn accept(&self, _a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)> {
+            unimplemented!("测试用: 不应调用");
+        }
+
+        async fn handshake(&self, _conn: Self::RawStream) -> Result<Self::Stream> {
+            unimplemented!("测试用: 不应调用");
+        }
+
+        async fn connect(&self, _addr: &AddrMaybeCached) -> Result<Self::Stream> {
+            unimplemented!("测试用: 不应调用");
+        }
+    }
+
+    fn build_service_config() -> ServerServiceConfig {
+        let mut service = ServerServiceConfig::with_name("test_service");
+        service.bind_addr = "127.0.0.1:0".to_string();
+        service
+    }
+
+    #[tokio::test]
+    async fn test_data_channel_handshake_releases_read_lock_on_backpressure() {
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let (data_ch_tx, mut data_ch_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        let handle = ControlChannelHandle {
+            _shutdown_tx: shutdown_tx,
+            data_ch_tx: data_ch_tx.clone(),
+            service: build_service_config(),
+            timestamp: 0,
+            addr: "127.0.0.1:0".parse().unwrap(),
+        };
+
+        let nonce = [0u8; HASH_WIDTH_IN_BYTES];
+        let service_digest = [1u8; HASH_WIDTH_IN_BYTES];
+
+        {
+            let mut map = control_channels.write().await;
+            assert!(map.insert(service_digest, nonce, handle).is_ok());
+        }
+
+        let (fill_stream, _fill_peer) = duplex(64);
+        data_ch_tx.send(fill_stream).await.unwrap();
+
+        let (conn, _peer) = duplex(64);
+        let control_channels_for_task = control_channels.clone();
+        let handshake_task = tokio::spawn(async move {
+            do_data_channel_handshake::<TestTransport>(conn, control_channels_for_task, nonce).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!handshake_task.is_finished());
+
+        let lock_result = timeout(Duration::from_millis(100), control_channels.write()).await;
+        assert!(lock_result.is_ok());
+        drop(lock_result.unwrap());
+
+        let _ = data_ch_rx.recv().await;
+        let _ = data_ch_rx.recv().await;
+
+        let result = timeout(Duration::from_secs(1), handshake_task).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_udp_idle_reconnect_resets_last_activity() -> Result<()> {
+        let (data_ch_tx, data_ch_rx) = mpsc::channel(4);
+        let (data_ch_req_tx, mut data_ch_req_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let pool_task = tokio::spawn(run_udp_connection_pool::<TestTransport>(
+            "127.0.0.1:0".to_string(),
+            data_ch_rx,
+            data_ch_req_tx,
+            shutdown_rx,
+        ));
+
+        let (conn, peer) = duplex(1024);
+        let _peer_guard = peer;
+        data_ch_tx.send(conn).await.unwrap();
+
+        let first_timeout = UDP_ACTIVITY_TIMEOUT + UDP_READ_TIMEOUT + UDP_READ_TIMEOUT;
+        let first_req = timeout(first_timeout, data_ch_req_rx.recv()).await?;
+        assert_eq!(first_req, Some(true));
+
+        let (conn2, peer2) = duplex(1024);
+        let _peer_guard2 = peer2;
+        data_ch_tx.send(conn2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let premature = timeout(UDP_READ_TIMEOUT + UDP_READ_TIMEOUT, data_ch_req_rx.recv()).await;
+        assert!(premature.is_err());
+
+        let _ = shutdown_tx.send(true);
+        drop(data_ch_tx);
+
+        let result = timeout(Duration::from_secs(1), pool_task).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_ok());
+        Ok(())
+    }
 }

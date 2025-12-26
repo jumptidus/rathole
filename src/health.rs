@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::broadcast;
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
@@ -330,6 +331,7 @@ pub async fn run_health_probe_task(
     bind_addr: String,
     config: HealthProbeConfig,
     is_tcp: bool,
+    mut shutdown_rx: broadcast::Receiver<bool>,
     on_failure: impl Fn() + Send + 'static,
 ) {
     if !config.enabled {
@@ -341,7 +343,13 @@ pub async fn run_health_probe_task(
     let mut consecutive_failures = 0u32;
 
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown_rx.recv() => {
+                debug!("服务 {} 健康探测收到关闭信号或通道已关闭，退出", service_name);
+                break;
+            }
+        }
 
         let probe_result = if is_tcp {
             tcp_health_probe_with_retry(&bind_addr, &config).await
@@ -658,7 +666,6 @@ mod tests {
     #[tokio::test]
     async fn test_quick_retry_eventually_success() {
         let (tx, mut rx) = mpsc::channel(1);
-        let failure_count = Arc::new(AtomicU32::new(0));
 
         // 模拟配置：快速失败2次后成功
         let config = HealthProbeConfig {
@@ -681,7 +688,7 @@ mod tests {
 
             // 第一次正常探测（失败）
             match probe_for_task.probe().await {
-                Ok(_) => consecutive_failures = 0,
+                Ok(_) => {}
                 Err(_) => {
                     consecutive_failures += 1;
 
@@ -689,7 +696,6 @@ mod tests {
                     for _ in 0..HEALTH_PROBE_QUICK_RETRY_COUNT {
                         match probe_for_task.probe().await {
                             Ok(_) => {
-                                consecutive_failures = 0;
                                 let _ = tx.send("success_after_retry".to_string()).await;
                                 return;
                             }
@@ -830,6 +836,36 @@ mod tests {
             Ok(None) => panic!("任务意外结束"),
             Err(_) => panic!("测试超时"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_health_probe_shutdown() {
+        let config = HealthProbeConfig {
+            enabled: true,
+            interval_secs: 60,
+            timeout_secs: 1,
+            max_failures: 1,
+            tcp_hosts: vec!["127.0.0.1:1".to_string()],
+            dns_servers: vec!["127.0.0.1:1".to_string()],
+            dns_query_domain: "example.com".to_string(),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        let task_handle = tokio::spawn(run_health_probe_task(
+            "test_service".to_string(),
+            "127.0.0.1:1".to_string(),
+            config,
+            true,
+            shutdown_rx,
+            || {},
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = shutdown_tx.send(true);
+
+        let result = timeout(Duration::from_secs(1), task_handle).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_ok());
     }
 
     // 测试探测时间计算

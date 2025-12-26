@@ -14,6 +14,7 @@ pub const DEFAULT_NODELAY: bool = true;
 pub const DEFAULT_KEEPALIVE_SECS: u64 = 20;
 pub const DEFAULT_KEEPALIVE_INTERVAL: u64 = 8;
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct AddrMaybeCached {
     pub addr: String,
@@ -21,6 +22,7 @@ pub struct AddrMaybeCached {
 }
 
 impl AddrMaybeCached {
+    #[allow(dead_code)]
     pub fn new(addr: &str) -> AddrMaybeCached {
         AddrMaybeCached {
             addr: addr.to_string(),
@@ -28,6 +30,7 @@ impl AddrMaybeCached {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn resolve(&mut self) -> Result<()> {
         match to_socket_addr(&self.addr).await {
             Ok(s) => {
@@ -64,6 +67,7 @@ pub trait Transport: Debug + Send + Sync {
     /// accept must be cancel safe
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)>;
     async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream>;
+    #[allow(dead_code)]
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream>;
 }
 
@@ -139,6 +143,7 @@ impl SocketOpts {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_client_cfg(cfg: &ClientServiceConfig) -> SocketOpts {
         SocketOpts {
             nodelay: cfg.nodelay,

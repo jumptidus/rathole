@@ -51,6 +51,7 @@ pub fn feature_neither_compile(feature1: &str, feature2: &str) -> ! {
     )
 }
 
+#[allow(dead_code)]
 pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
     lookup_host(addr)
         .await?
@@ -58,12 +59,14 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("Failed to lookup the host"))
 }
 
+#[allow(dead_code)]
 pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
     let semi = s.rfind(':').expect("missing semicolon");
     Ok((&s[..semi], s[semi + 1..].parse()?))
 }
 
 /// Create a UDP socket and connect to `addr`
+#[allow(dead_code)]
 pub async fn udp_connect<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket> {
     let addr = to_socket_addr(addr).await?;
 
@@ -79,6 +82,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket> {
 
 /// Create a TcpStream using a proxy
 /// e.g. socks5://user:pass@127.0.0.1:1080 http://127.0.0.1:8080
+#[allow(dead_code)]
 pub async fn tcp_connect_with_proxy(
     addr: &AddrMaybeCached,
     proxy: Option<&Url>,

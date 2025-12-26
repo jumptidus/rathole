@@ -75,6 +75,7 @@ pub struct UdpTraffic {
 }
 
 impl UdpTraffic {
+    #[allow(dead_code)]
     pub async fn write<T: AsyncWrite + Unpin>(&self, writer: &mut T) -> Result<()> {
         let hdr = UdpHeader {
             from: self.from,
@@ -143,6 +144,7 @@ pub fn digest(data: &[u8]) -> Digest {
     d.into()
 }
 
+#[allow(dead_code)]
 struct PacketLength {
     hello: usize,
     ack: usize,
@@ -230,6 +232,7 @@ pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resul
     bincode::deserialize(&buf).with_context(|| "Failed to deserialize auth")
 }
 
+#[allow(dead_code)]
 pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
     let mut bytes = vec![0u8; PACKET_LEN.ack];
     conn.read_exact(&mut bytes)
@@ -238,6 +241,7 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize ack")
 }
 
+#[allow(dead_code)]
 pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<ControlChannelCmd> {
@@ -248,6 +252,7 @@ pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize control cmd")
 }
 
+#[allow(dead_code)]
 pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<DataChannelCmd> {

@@ -4,7 +4,9 @@ use std::time::Duration;
 // FIXME: Determine reasonable size
 /// UDP MTU. Currently far larger than necessary
 pub const UDP_BUFFER_SIZE: usize = 2048;
+#[allow(dead_code)]
 pub const UDP_SENDQ_SIZE: usize = 1024;
+#[allow(dead_code)]
 pub const UDP_TIMEOUT: u64 = 60;
 
 pub fn listen_backoff() -> ExponentialBackoff {
@@ -15,6 +17,7 @@ pub fn listen_backoff() -> ExponentialBackoff {
     }
 }
 
+#[allow(dead_code)]
 pub fn run_control_chan_backoff(interval: u64) -> ExponentialBackoff {
     ExponentialBackoff {
         randomization_factor: 0.2,

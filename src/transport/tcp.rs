@@ -12,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 #[derive(Debug)]
 pub struct TcpTransport {
     socket_opts: SocketOpts,
+    #[allow(dead_code)]
     cfg: TcpConfig,
 }
 

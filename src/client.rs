@@ -309,27 +309,67 @@ async fn run_data_channel_for_tcp<T: Transport>(
     };
     tokio::pin!(idle_future);
 
-    tokio::select! {
-        res = &mut client_to_local => {
-            match res {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => debug!("数据通道转发失败: {}", err),
-                Err(err) => debug!("数据通道转发任务异常: {}", err),
+    let mut client_done = false;
+    let mut local_done = false;
+
+    loop {
+        tokio::select! {
+            res = &mut client_to_local, if !client_done => {
+                client_done = true;
+                match res {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        debug!("数据通道转发失败: {}", err);
+                        if !local_done {
+                            local_to_client.abort();
+                            local_done = true;
+                        }
+                    }
+                    Err(err) => {
+                        debug!("数据通道转发任务异常: {}", err);
+                        if !local_done {
+                            local_to_client.abort();
+                            local_done = true;
+                        }
+                    }
+                }
             }
-            local_to_client.abort();
-        }
-        res = &mut local_to_client => {
-            match res {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => debug!("数据通道转发失败: {}", err),
-                Err(err) => debug!("数据通道转发任务异常: {}", err),
+            res = &mut local_to_client, if !local_done => {
+                local_done = true;
+                match res {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        debug!("数据通道转发失败: {}", err);
+                        if !client_done {
+                            client_to_local.abort();
+                            client_done = true;
+                        }
+                    }
+                    Err(err) => {
+                        debug!("数据通道转发任务异常: {}", err);
+                        if !client_done {
+                            client_to_local.abort();
+                            client_done = true;
+                        }
+                    }
+                }
             }
-            client_to_local.abort();
+            _ = &mut idle_future => {
+                debug!("数据通道空闲超时({:?})，主动关闭", idle_timeout);
+                if !client_done {
+                    client_to_local.abort();
+                    client_done = true;
+                }
+                if !local_done {
+                    local_to_client.abort();
+                    local_done = true;
+                }
+                break;
+            }
         }
-        _ = &mut idle_future => {
-            debug!("数据通道空闲超时({:?})，主动关闭", idle_timeout);
-            client_to_local.abort();
-            local_to_client.abort();
+
+        if client_done && local_done {
+            break;
         }
     }
 

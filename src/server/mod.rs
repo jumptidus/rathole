@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io;
 use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{error, info, info_span, warn, Instrument};
 
@@ -39,6 +40,7 @@ const TCP_POOL_SIZE: usize = 8; // TCP服务的缓存连接数
 const UDP_POOL_SIZE: usize = 2; // UDP服务的缓存连接数
 const CHAN_SIZE: usize = 2048; // 通道的容量
 const HANDSHAKE_TIMEOUT: u64 = 5; // 握手超时时间(秒)
+const SHUTDOWN_GRACE_SECS: u64 = 10; // 优雅关闭最长等待时间(秒)
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -162,6 +164,7 @@ impl<T: 'static + Transport> Server<T> {
         };
 
         let mut update_enabled = true;
+        let mut handshake_tasks = JoinSet::new();
 
         // Wait for connections and shutdown signals
         loop {
@@ -209,7 +212,7 @@ impl<T: 'static + Transport> Server<T> {
                             let control_channels = self.control_channels.clone();
                             let server_config = self.config.clone();
 
-                            tokio::spawn(async move {
+                            handshake_tasks.spawn(async move {
                                 let _permit = permit;
                                 match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), transport.handshake(conn)).await {
                                     Ok(conn_result) => {
@@ -231,9 +234,18 @@ impl<T: 'static + Transport> Server<T> {
                         }
                     }
                 },
+                res = handshake_tasks.join_next(), if !handshake_tasks.is_empty() => {
+                    match res {
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) => {
+                            warn!("握手任务异常退出: {}", err);
+                        }
+                        None => {}
+                    }
+                },
                 // Wait for the shutdown signal
                 _ = shutdown_rx.recv() => {
-                    info!("Shutting down gracefully...");
+                    info!("开始优雅关闭...");
                     break;
                 },
                 e = update_rx.recv(), if update_enabled => {
@@ -248,6 +260,17 @@ impl<T: 'static + Transport> Server<T> {
                     }
                 },
             }
+        }
+
+        let control_channels = self.shutdown_control_channels().await;
+        if control_channels > 0 {
+            info!("已发送关闭信号到{}个控制通道", control_channels);
+        }
+
+        let graceful = self.wait_for_shutdown(&mut handshake_tasks).await;
+        if !graceful {
+            let remaining = self.control_channels.read().await.len();
+            warn!(remaining, "优雅关闭超时, 存在未关闭的控制通道");
         }
 
         info!("Shutdown");
@@ -283,5 +306,34 @@ impl<T: 'static + Transport> Server<T> {
                 ignored
             ),
         }
+    }
+
+    async fn shutdown_control_channels(&self) -> usize {
+        let control_channels = self.control_channels.read().await;
+        let total = control_channels.len();
+        control_channels.for_each_value(|handle| {
+            handle.shutdown();
+        });
+        total
+    }
+
+    async fn wait_for_shutdown(&self, handshake_tasks: &mut JoinSet<()>) -> bool {
+        let result = time::timeout(Duration::from_secs(SHUTDOWN_GRACE_SECS), async {
+            while let Some(res) = handshake_tasks.join_next().await {
+                if let Err(err) = res {
+                    warn!("握手任务异常退出: {}", err);
+                }
+            }
+
+            loop {
+                if self.control_channels.read().await.is_empty() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+
+        result.is_ok()
     }
 }

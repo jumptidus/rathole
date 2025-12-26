@@ -46,6 +46,24 @@ impl<K1, K2, V> MultiMap<K1, K2, V> {
             map2: HashMap::new(),
         }
     }
+
+    pub fn len(&self) -> usize {
+        self.map1.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map1.is_empty()
+    }
+
+    pub fn for_each_value<F>(&self, mut f: F)
+    where
+        F: FnMut(&V),
+    {
+        for item in self.map1.values() {
+            let item = unsafe { &*item.0 };
+            f(&item.2);
+        }
+    }
 }
 
 #[allow(dead_code)]

@@ -152,6 +152,8 @@ impl<T: 'static + Transport> Server<T> {
             ..Default::default()
         };
 
+        let mut update_enabled = true;
+
         // Wait for connections and shutdown signals
         loop {
             tokio::select! {
@@ -213,11 +215,17 @@ impl<T: 'static + Transport> Server<T> {
                     info!("Shutting down gracefully...");
                     break;
                 },
-                e = update_rx.recv() => {
-                    if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
+                e = update_rx.recv(), if update_enabled => {
+                    match e {
+                        Some(e) => {
+                            self.handle_hot_reload(e).await;
+                        }
+                        None => {
+                            update_enabled = false;
+                            warn!("配置热更新通道已关闭, 将继续运行但不再处理热更新");
+                        }
                     }
-                }
+                },
             }
         }
 

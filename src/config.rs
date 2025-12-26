@@ -12,6 +12,7 @@ use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAU
 /// Application-layer heartbeat interval in secs
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
+const DEFAULT_DATA_CHANNEL_WAIT_TIMEOUT_SECS: u64 = 5;
 
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
@@ -214,6 +215,10 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+fn default_data_channel_wait_timeout() -> u64 {
+    DEFAULT_DATA_CHANNEL_WAIT_TIMEOUT_SECS
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -224,6 +229,8 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    #[serde(default = "default_data_channel_wait_timeout")]
+    pub data_channel_wait_timeout: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -437,6 +444,25 @@ mod tests {
                 .unwrap()
                 .0,
             "4"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_data_channel_wait_timeout() -> Result<()> {
+        let config_str = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+
+[server.services.service1]
+token = "token"
+bind_addr = "0.0.0.0:8081"
+"#;
+        let cfg = Config::from_str(config_str)?;
+        let server = cfg.server.expect("server config missing");
+        assert_eq!(
+            server.data_channel_wait_timeout,
+            DEFAULT_DATA_CHANNEL_WAIT_TIMEOUT_SECS
         );
         Ok(())
     }

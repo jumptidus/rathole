@@ -484,6 +484,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             conn,
             service_config.clone(),
             server_config.heartbeat_interval,
+            server_config.data_channel_wait_timeout,
             timestamp,
             addr,
         );
@@ -679,6 +680,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        data_channel_wait_timeout: u64,
         timestamp: u64,
         addr: SocketAddr,
     ) -> (Self, impl Future<Output = Result<()>> + Send + 'static) {
@@ -711,6 +713,7 @@ where
                             bind_addr,
                             data_ch_rx,
                             data_ch_req_tx_clone,
+                            data_channel_wait_timeout,
                             shutdown_rx_clone,
                         )
                         .await
@@ -935,16 +938,33 @@ fn tcp_listen_and_send(
                         }
                         Ok((incoming, addr)) => {
                             // 对于每个访问者, 请求创建一个数据通道
-                            // 使用 .await 和处理有界通道发送的错误
-                            if let Err(e) = data_ch_req_tx.send(true).await {
-								error!("发送数据通道请求失败 (可能控制通道已关闭): {}. 监听器退出.", e);
-                                break; // 如果发送失败, 退出循环
+                            // 使用 try_send 避免阻塞 accept
+                            match data_ch_req_tx.try_send(true) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!("数据通道请求队列已满, 拒绝新连接: {}", addr);
+                                    continue;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    error!("发送数据通道请求失败: 请求通道已关闭, 监听器退出.");
+                                    break; // 控制通道已关闭, 退出循环
+                                }
                             }
-                            backoff.reset(); // 重置重试计数器
-                            debug!("新的客户端连接: {}", addr);
-
                             // 将访问者发送到连接池
-                            let _ = tx.send(incoming).await;
+                            match tx.try_send(incoming) {
+                                Ok(()) => {
+                                    backoff.reset(); // 重置重试计数器
+                                    debug!("新的客户端连接: {}", addr);
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!("访客队列已满, 拒绝新连接: {}", addr);
+                                    continue;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    error!("访客队列已关闭, 监听器退出.");
+                                    break;
+                                }
+                            }
                         }
                     }
                 },
@@ -965,14 +985,35 @@ async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::Sender<bool>,
+    data_channel_wait_timeout: u64,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
+    let mut visitor_rx =
+        tcp_listen_and_send(bind_addr.clone(), data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp)?;
+    let data_ch_wait_timeout = if data_channel_wait_timeout == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(data_channel_wait_timeout))
+    };
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
-            if let Some(mut ch) = data_ch_rx.recv().await {
+            let ch = match data_ch_wait_timeout {
+                Some(timeout_duration) => match timeout(timeout_duration, data_ch_rx.recv()).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        warn!(
+                            bind_addr = %bind_addr,
+                            timeout_secs = data_channel_wait_timeout,
+                            "等待数据通道超时, 关闭访客连接"
+                        );
+                        break;
+                    }
+                },
+                None => data_ch_rx.recv().await,
+            };
+            if let Some(mut ch) = ch {
                 // 写入开始传输Tcp数据指令
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
                     // 开始传输数据

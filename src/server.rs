@@ -1300,18 +1300,18 @@ async fn run_udp_connection_pool<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::{
-        do_data_channel_handshake, run_udp_connection_pool, ControlChannelHandle,
-        ControlChannelMap, ServerServiceConfig, SocketOpts, Transport, UDP_ACTIVITY_TIMEOUT,
-        UDP_READ_TIMEOUT, HASH_WIDTH_IN_BYTES, Result,
+        do_data_channel_handshake, run_tcp_connection_pool, run_udp_connection_pool,
+        ControlChannelHandle, ControlChannelMap, ServerServiceConfig, SocketOpts, Transport,
+        UDP_ACTIVITY_TIMEOUT, UDP_READ_TIMEOUT, HASH_WIDTH_IN_BYTES, Result,
     };
     use async_trait::async_trait;
-    use std::net::SocketAddr;
+    use std::net::{SocketAddr, TcpListener};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::io::duplex;
-    use tokio::net::ToSocketAddrs;
+    use tokio::io::{duplex, AsyncReadExt};
+    use tokio::net::{TcpStream, ToSocketAddrs};
     use tokio::sync::{broadcast, mpsc, RwLock};
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout, Instant};
 
     use crate::config::TransportConfig;
     use crate::transport::AddrMaybeCached;
@@ -1352,6 +1352,27 @@ mod tests {
         let mut service = ServerServiceConfig::with_name("test_service");
         service.bind_addr = "127.0.0.1:0".to_string();
         service
+    }
+
+    fn pick_unused_port() -> Result<u16> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        Ok(port)
+    }
+
+    async fn connect_with_retry(addr: &str, wait: Duration) -> Result<TcpStream> {
+        let deadline = Instant::now() + wait;
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e.into());
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -1398,6 +1419,42 @@ mod tests {
         let result = timeout(Duration::from_secs(1), handshake_task).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tcp_data_channel_wait_timeout_closes_visitor() -> Result<()> {
+        let (data_ch_tx, data_ch_rx) = mpsc::channel(1);
+        let (data_ch_req_tx, mut data_ch_req_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let port = pick_unused_port()?;
+        let bind_addr = format!("127.0.0.1:{}", port);
+
+        let pool_task = tokio::spawn(run_tcp_connection_pool::<TestTransport>(
+            bind_addr.clone(),
+            data_ch_rx,
+            data_ch_req_tx,
+            1,
+            shutdown_rx,
+        ));
+
+        let mut client = connect_with_retry(&bind_addr, Duration::from_secs(1)).await?;
+        let req = timeout(Duration::from_secs(1), data_ch_req_rx.recv()).await?;
+        assert_eq!(req, Some(true));
+
+        let mut buf = [0u8; 1];
+        let read_result = timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(read_result.is_ok());
+        let n = read_result.unwrap()?;
+        assert_eq!(n, 0);
+
+        let _ = shutdown_tx.send(true);
+        drop(data_ch_tx);
+
+        let result = timeout(Duration::from_secs(2), pool_task).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_ok());
+        Ok(())
     }
 
     #[tokio::test]

@@ -12,8 +12,9 @@ type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
 const PROTO_V1: u8 = 1u8;
 pub const PROTO_V2: u8 = 2u8;
+pub const PROTO_V3: u8 = 3u8;
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
@@ -52,6 +53,7 @@ impl std::fmt::Display for Ack {
 #[derive(Deserialize, Serialize, Debug)]
 pub enum ControlChannelCmd {
     CreateDataChannel,
+    CreateDataMux,
     HeartBeat,
 }
 
@@ -59,6 +61,23 @@ pub enum ControlChannelCmd {
 pub enum DataChannelCmd {
     StartForwardTcp,
     StartForwardUdp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DataChannelMode {
+    Plain = 0,
+    Mux = 1,
+}
+
+impl DataChannelMode {
+    pub fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(DataChannelMode::Plain),
+            1 => Ok(DataChannelMode::Mux),
+            _ => bail!("未知的数据通道模式: {}", v),
+        }
+    }
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -201,7 +220,7 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     match hello {
         Hello::ControlChannelHello(v, _) => {
             // 服务端兼容v2和v1
-            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 {
+            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 && v != PROTO_V1 {
                 bail!(
                     "协议版本不匹配. 期望 {}, 实际 {}. 请更新 `rathole`.",
                     CURRENT_PROTO_VERSION,
@@ -211,7 +230,7 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
         }
         Hello::DataChannelHello(v, _) => {
             // 服务端兼容v2和v1
-            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 {
+            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 && v != PROTO_V1 {
                 bail!(
                     "协议版本不匹配. 期望 {}, 实际 {}. 请更新 `rathole`.",
                     CURRENT_PROTO_VERSION,
@@ -222,6 +241,26 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     }
 
     Ok(hello)
+}
+
+pub async fn read_data_channel_mode<T: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut T,
+) -> Result<DataChannelMode> {
+    let v = conn
+        .read_u8()
+        .await
+        .with_context(|| "读取数据通道模式失败")?;
+    DataChannelMode::from_u8(v)
+}
+
+pub async fn write_data_channel_mode<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    mode: DataChannelMode,
+) -> Result<()> {
+    conn.write_u8(mode as u8)
+        .await
+        .with_context(|| "写入数据通道模式失败")?;
+    Ok(())
 }
 
 pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {

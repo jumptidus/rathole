@@ -1,16 +1,17 @@
 use crate::config::{ServerServiceConfig, ServiceType};
 use crate::helper::write_and_flush;
-use crate::protocol::{Ack, ControlChannelCmd};
+use crate::protocol::{Ack, ControlChannelCmd, PROTO_V3};
 use crate::transport::{SocketOpts, Transport};
 use anyhow::{anyhow, Context, Result};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, Instrument, Span};
 
-use super::{CHAN_SIZE, TCP_POOL_SIZE, UDP_POOL_SIZE};
+use super::{mux::MuxPool, DataChannelRequest, CHAN_SIZE, TCP_POOL_SIZE, UDP_POOL_SIZE};
 use super::tcp_pool::run_tcp_connection_pool;
 use super::udp_pool::run_udp_connection_pool;
 
@@ -24,6 +25,7 @@ pub(super) struct ControlChannelHandle<T: Transport> {
     // 添加时间戳字段，记录连接建立时间
     timestamp: u64,
     addr: SocketAddr,
+    mux_pool: Option<Arc<MuxPool>>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -38,6 +40,7 @@ where
         service: ServerServiceConfig,
         heartbeat_interval: u64,
         data_channel_wait_timeout: u64,
+        protocol_version: u8,
         timestamp: u64,
         addr: SocketAddr,
     ) -> (Self, impl Future<Output = Result<()>> + Send + 'static) {
@@ -47,9 +50,35 @@ where
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::channel(data_channel_request_buffer); // 缓冲区
 
         // 获得 TCP 或 UDP 的服务池大小
+        let mux_enabled = service.service_type == ServiceType::Tcp
+            && service.enable_mux
+            && protocol_version == PROTO_V3;
         let pool_size = match service.service_type {
-            ServiceType::Tcp => TCP_POOL_SIZE,
+            ServiceType::Tcp => {
+                if mux_enabled {
+                    service.mux_pool_size
+                } else {
+                    TCP_POOL_SIZE
+                }
+            }
             ServiceType::Udp => UDP_POOL_SIZE,
+        };
+
+        let mux_pool = if mux_enabled {
+            let pool = MuxPool::new(
+                service.mux_select,
+                service.mux_pool_size,
+                service.mux_max_streams,
+                service.mux_idle_timeout,
+                data_ch_req_tx.clone(),
+            );
+            let pool_clone = pool.clone();
+            tokio::spawn(async move {
+                pool_clone.ensure_target().await;
+            });
+            Some(pool)
+        } else {
+            None
         };
 
         // 启动连接池任务 (获取相关通道的所有权)
@@ -64,6 +93,7 @@ where
                 let shutdown_rx_clone = shutdown_tx.subscribe(); // 订阅关闭channel
                 let bind_addr = service.bind_addr.clone(); // 绑定地址
                 let data_ch_req_tx_clone = data_ch_req_tx.clone(); // 克隆发送者
+                let mux_pool_for_tcp = mux_pool.clone();
                 tokio::spawn(
                     async move {
                         // 运行TCP连接池任务
@@ -71,6 +101,8 @@ where
                             bind_addr,
                             data_ch_rx,
                             data_ch_req_tx_clone,
+                            mux_pool_for_tcp,
+                            service.stream_idle_timeout,
                             data_channel_wait_timeout,
                             shutdown_rx_clone,
                         )
@@ -117,6 +149,8 @@ where
             heartbeat_interval,
             pool_size,
             data_ch_req_tx: data_ch_req_tx.clone(),
+            mux_enabled,
+            protocol_version,
         };
 
         // 创建控制通道句柄实例（返回给调用者）
@@ -126,6 +160,7 @@ where
             service,
             timestamp,
             addr,
+            mux_pool,
         };
 
         // 创建控制通道 Future，将执行控制通道逻辑
@@ -160,6 +195,10 @@ where
         self.addr
     }
 
+    pub(super) fn mux_pool(&self) -> Option<Arc<MuxPool>> {
+        self.mux_pool.clone()
+    }
+
     #[cfg(test)]
     pub(super) fn new_for_test(
         shutdown_tx: broadcast::Sender<bool>,
@@ -174,6 +213,7 @@ where
             service,
             timestamp,
             addr,
+            mux_pool: None,
         }
     }
 }
@@ -182,10 +222,12 @@ where
 struct ControlChannel<T: Transport> {
     conn: T::Stream, // The connection of control channel // 控制通道连接
     shutdown_rx: broadcast::Receiver<bool>, // Receives the shutdown signal // 接收关闭信号
-    data_ch_req_rx: mpsc::Receiver<bool>, // Receives visitor connections (Bounded Receiver) // 接收访客连接请求（有界接收器）
+    data_ch_req_rx: mpsc::Receiver<DataChannelRequest>, // Receives visitor connections (Bounded Receiver) // 接收访客连接请求（有界接收器）
     heartbeat_interval: u64, // Application-layer heartbeat interval in secs // 应用层心跳间隔（秒）
     pool_size: usize,        // Initial pool size to request // 初始池大小请求
-    data_ch_req_tx: mpsc::Sender<bool>, // Sender to request data channels (Bounded Sender) // 发送器请求数据通道（有界发送器）
+    data_ch_req_tx: mpsc::Sender<DataChannelRequest>, // Sender to request data channels (Bounded Sender) // 发送器请求数据通道（有界发送器）
+    mux_enabled: bool,
+    protocol_version: u8,
 }
 
 impl<T: Transport> ControlChannel<T> {
@@ -214,8 +256,13 @@ impl<T: Transport> ControlChannel<T> {
             pool_size = self.pool_size,
             "发送初始数据通道请求..., 池大小: {}", self.pool_size
         );
+        let initial_req = if self.mux_enabled {
+            DataChannelRequest::Mux
+        } else {
+            DataChannelRequest::Plain
+        };
         for i in 0..self.pool_size {
-            if let Err(e) = self.data_ch_req_tx.send(true).await {
+            if let Err(e) = self.data_ch_req_tx.send(initial_req).await {
                 error!(
                     "发送初始数据通道请求失败 #{}/{}: {}, 控制通道关闭",
                     i + 1,
@@ -228,14 +275,19 @@ impl<T: Transport> ControlChannel<T> {
         debug!("发送初始数据通道请求成功, 数量: {}", self.pool_size);
 
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel)?;
+        let create_mux_cmd = bincode::serialize(&ControlChannelCmd::CreateDataMux)?;
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat)?;
 
         loop {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
-                        Some(_) => {
-                            let write_future = self.write_and_flush(&create_ch_cmd);
+                        Some(req) => {
+                            let cmd = match req {
+                                DataChannelRequest::Mux if self.mux_enabled && self.protocol_version == PROTO_V3 => &create_mux_cmd,
+                                _ => &create_ch_cmd,
+                            };
+                            let write_future = self.write_and_flush(cmd);
                             match time::timeout(Duration::from_secs(CONTROL_CHANNEL_WRITE_TIMEOUT), write_future).await {
                                 Ok(Ok(_)) => {}, // 写入成功
                                 Ok(Err(e)) => {

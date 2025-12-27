@@ -1,6 +1,7 @@
 mod control;
 mod handshake;
 mod health;
+mod mux;
 mod tcp_pool;
 mod udp_pool;
 #[cfg(test)]
@@ -18,8 +19,7 @@ use crate::transport::TlsTransport;
 use crate::transport::WebsocketTransport;
 use crate::transport::{TcpTransport, Transport};
 use anyhow::{anyhow, Context, Result};
-use backoff::backoff::Backoff;
-use backoff::ExponentialBackoff;
+use backon::{BackoffBuilder, ExponentialBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +35,12 @@ type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, control::ControlChannelHandle<T>>;
+
+#[derive(Debug, Clone, Copy)]
+enum DataChannelRequest {
+    Plain,
+    Mux,
+}
 
 const TCP_POOL_SIZE: usize = 8; // TCP服务的缓存连接数
 const UDP_POOL_SIZE: usize = 2; // UDP服务的缓存连接数
@@ -148,11 +154,13 @@ impl<T: 'static + Transport> Server<T> {
         info!("开始监听: {}", self.config.bind_addr);
 
         // Retry at least every 100 ms
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_millis(100),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
+        let backoff_builder = ExponentialBuilder::default()
+            .with_factor(1.5)
+            .with_min_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_millis(100))
+            .without_max_times()
+            .with_jitter();
+        let mut backoff = backoff_builder.build();
 
         let max_inflight_handshakes = self.config.max_inflight_handshakes;
         let handshake_semaphore = if max_inflight_handshakes == 0 {
@@ -178,13 +186,9 @@ impl<T: 'static + Transport> Server<T> {
                                 // If it is an IO error, then it's possibly an
                                 // EMFILE. So sleep for a while and retry
                                 // TODO: Only sleep for EMFILE, ENFILE, ENOMEM, ENOBUFS
-                                if let Some(d) = backoff.next_backoff() {
+                                if let Some(d) = backoff.next() {
                                     error!("IO错误: {:#}. 重试中... {:?}...", err, d);
                                     time::sleep(d).await;
-                                } else {
-                                    // This branch will never be executed according to the current retry policy
-                                    error!("[预期之外的错误] 当前重试策略不应到达,重试次数过多. 终止...");
-                                    break;
                                 }
                             } else {
                                 // If it's not an IO error, then it comes from
@@ -194,7 +198,7 @@ impl<T: 'static + Transport> Server<T> {
                             }
                         }
                         Ok((conn, addr)) => {
-                            backoff.reset();
+                            backoff = backoff_builder.build();
 
                             let permit = match handshake_semaphore.as_ref() {
                                 Some(sem) => match sem.clone().try_acquire_owned() {

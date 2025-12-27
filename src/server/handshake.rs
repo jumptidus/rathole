@@ -1,7 +1,9 @@
 use crate::config::{ServerConfig, ServerServiceConfig, ServiceType};
 use crate::helper::write_and_flush;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
-use crate::protocol::{self, read_auth, read_hello, Ack, HASH_WIDTH_IN_BYTES, PROTO_V2};
+use crate::protocol::{
+    self, read_auth, read_hello, Ack, DataChannelMode, HASH_WIDTH_IN_BYTES, PROTO_V2, PROTO_V3,
+};
 use crate::transport::{SocketOpts, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use rand::RngCore;
@@ -10,13 +12,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use super::control::ControlChannelHandle;
 use super::health::spawn_health_probe_task;
-use super::{ControlChannelMap, Nonce, ServiceDigest, HANDSHAKE_TIMEOUT};
+use super::{mux::run_mux_server, ControlChannelMap, Nonce, ServiceDigest, CHAN_SIZE, HANDSHAKE_TIMEOUT};
+use tokio_util::compat::TokioAsyncReadCompatExt;
+use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode as YamuxMode};
 
 // Handle connections to `server.bind_addr`
 pub(super) async fn handle_connection<T: 'static + Transport>(
@@ -50,8 +54,8 @@ pub(super) async fn handle_connection<T: 'static + Transport>(
     match hello {
         ControlChannelHello(protocol_version, service_digest) => {
             // 根据协议版本处理时间戳
-            let timestamp = if protocol_version == PROTO_V2 {
-                // 对于V2协议, 客户端必须发送时间戳
+            let timestamp = if protocol_version == PROTO_V2 || protocol_version == PROTO_V3 {
+                // 对于V2/V3协议, 客户端必须发送时间戳
                 match timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), conn.read_u64_le()).await {
                     Ok(Ok(ts)) => {
                         debug!("成功读取V2客户端时间戳: {}", ts);
@@ -82,13 +86,14 @@ pub(super) async fn handle_connection<T: 'static + Transport>(
                 control_channels,
                 service_digest,
                 server_config,
+                protocol_version,
                 timestamp,
                 addr,
             )
             .await?;
         }
-        DataChannelHello(_, nonce) => {
-            do_data_channel_handshake(conn, control_channels, nonce).await?;
+        DataChannelHello(protocol_version, nonce) => {
+            do_data_channel_handshake(conn, control_channels, nonce, protocol_version).await?;
         }
     }
     Ok(())
@@ -142,6 +147,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
+    protocol_version: u8,
     timestamp: u64,
     addr: SocketAddr,
 ) -> Result<()> {
@@ -165,15 +171,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                 v.len()
             )
         })?;
-    let hello_send = ControlChannelHello(
-        // 如果时间戳为0, 使用当前协议版本, 否则使用v2协议
-        if timestamp == 0 {
-            protocol::CURRENT_PROTO_VERSION
-        } else {
-            protocol::PROTO_V2
-        },
-        nonce_array,
-    );
+    let hello_send = ControlChannelHello(protocol_version, nonce_array);
     let hello_bytes = bincode::serialize(&hello_send)?;
     write_and_flush_with_timeout(&mut conn, &hello_bytes, "发送握手消息").await?;
 
@@ -301,6 +299,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             service_config.clone(),
             server_config.heartbeat_interval,
             server_config.data_channel_wait_timeout,
+            protocol_version,
             timestamp,
             addr,
         );
@@ -421,28 +420,63 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 }
 
 async fn do_data_channel_handshake<T: 'static + Transport>(
-    conn: T::Stream,
+    mut conn: T::Stream,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     nonce: Nonce,
+    protocol_version: u8,
 ) -> Result<()> {
     debug!("Try to handshake a data channel");
+
+    let mode = if protocol_version == PROTO_V3 {
+        protocol::read_data_channel_mode(&mut conn).await?
+    } else {
+        DataChannelMode::Plain
+    };
 
     // Validate
     let data_channel = {
         let control_channels_guard = control_channels.read().await;
         control_channels_guard.get2(&nonce).map(|handle| {
-            (handle.data_channel_sender(), handle.socket_opts())
+            (
+                handle.data_channel_sender(),
+                handle.socket_opts(),
+                handle.mux_pool(),
+                handle.subscribe_shutdown(),
+            )
         })
     };
     match data_channel {
-        Some((data_ch_tx, socket_opts)) => {
+        Some((data_ch_tx, socket_opts, mux_pool, shutdown_rx)) => {
             T::hint(&conn, socket_opts);
 
-            // Send the data channel to the corresponding control channel
-            data_ch_tx
-                .send(conn)
-                .await
-                .with_context(|| "Data channel for a stale control channel")?;
+            match mode {
+                DataChannelMode::Plain => {
+                    // Send the data channel to the corresponding control channel
+                    data_ch_tx
+                        .send(conn)
+                        .await
+                        .with_context(|| "Data channel for a stale control channel")?;
+                }
+                DataChannelMode::Mux => {
+                    let Some(pool) = mux_pool else {
+                        warn!("收到 Mux 数据通道但 mux 未启用, 已丢弃");
+                        return Ok(());
+                    };
+                    let mut cfg = YamuxConfig::default();
+                    cfg.set_max_num_streams(pool.max_streams());
+
+                    let yamux_conn = YamuxConnection::new(conn.compat(), cfg, YamuxMode::Server);
+                    let (open_tx, open_rx) = mpsc::channel(CHAN_SIZE / 2);
+                    let session = pool.add_session(open_tx).await;
+                    tokio::spawn(run_mux_server(
+                        yamux_conn,
+                        open_rx,
+                        pool.clone(),
+                        session,
+                        shutdown_rx,
+                    ));
+                }
+            }
         }
         None => {
             warn!("Data channel has incorrect nonce");

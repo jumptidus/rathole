@@ -3,23 +3,26 @@ use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
-    DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
+    self, read_ack, read_control_cmd, read_data_cmd, read_hello, write_data_channel_mode, Ack,
+    Auth, ControlChannelCmd, DataChannelCmd, DataChannelMode, UdpTraffic, CURRENT_PROTO_VERSION,
+    HASH_WIDTH_IN_BYTES, PROTO_V3,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
-use backoff::backoff::Backoff;
-use backoff::future::retry_notify;
-use backoff::ExponentialBackoff;
+use backon::ExponentialBuilder;
+use backon::Retryable;
 use bytes::{Bytes, BytesMut};
+use futures::future::poll_fn;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+use tokio::io::{self, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode as YamuxMode};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -176,28 +179,29 @@ struct RunDataChannelArgs<T: Transport> {
 
 async fn do_data_channel_handshake<T: Transport>(
     args: Arc<RunDataChannelArgs<T>>,
+    mode: DataChannelMode,
 ) -> Result<T::Stream> {
     // Retry at least every 100ms, at most for 10 seconds
-    let backoff = ExponentialBackoff {
-        max_interval: Duration::from_millis(100),
-        max_elapsed_time: Some(Duration::from_secs(10)),
-        ..Default::default()
-    };
+    let backoff = ExponentialBuilder::default()
+        .with_factor(2.0)
+        .with_min_delay(Duration::from_millis(100))
+        .with_max_delay(Duration::from_millis(100))
+        .with_total_delay(Some(Duration::from_secs(10)))
+        .without_max_times()
+        .with_jitter();
 
     // Connect to remote_addr
-    let mut conn: T::Stream = retry_notify(
-        backoff,
-        || async {
-            args.connector
-                .connect(&args.remote_addr)
-                .await
-                .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
-                .map_err(backoff::Error::transient)
-        },
-        |e, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
-        },
-    )
+    let mut conn: T::Stream = (|| async {
+        args.connector
+            .connect(&args.remote_addr)
+            .await
+            .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+    })
+    .retry(backoff)
+    .sleep(tokio::time::sleep)
+    .notify(|e: &anyhow::Error, duration| {
+        warn!("{:#}. Retry in {:?}", e, duration);
+    })
     .await?;
 
     T::hint(&conn, args.socket_opts);
@@ -206,6 +210,9 @@ async fn do_data_channel_handshake<T: Transport>(
     let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
     conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
+    if CURRENT_PROTO_VERSION == PROTO_V3 {
+        write_data_channel_mode(&mut conn, mode).await?;
+    }
     conn.flush().await?;
 
     Ok(conn)
@@ -213,7 +220,7 @@ async fn do_data_channel_handshake<T: Transport>(
 
 async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Result<()> {
     // Do the handshake
-    let mut conn = do_data_channel_handshake(args.clone()).await?;
+    let mut conn = do_data_channel_handshake(args.clone(), DataChannelMode::Plain).await?;
 
     // Forward
     match read_data_cmd(&mut conn).await? {
@@ -221,7 +228,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_tcp(conn, &args.service.local_addr).await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
@@ -235,16 +242,89 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp<T: Transport>(
-    mut conn: T::Stream,
-    local_addr: &str,
-) -> Result<()> {
+async fn run_data_channel_for_tcp<S>(mut conn: S, local_addr: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     debug!("New data channel starts forwarding");
 
     let mut local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
     let _ = copy_bidirectional(&mut conn, &mut local).await;
+    Ok(())
+}
+
+struct MuxActiveGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for MuxActiveGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+async fn run_data_mux<T: Transport>(
+    args: Arc<RunDataChannelArgs<T>>,
+    active: Arc<AtomicUsize>,
+    max_pool: usize,
+) -> Result<()> {
+    let current = active.fetch_add(1, Ordering::AcqRel);
+    if current >= max_pool {
+        active.fetch_sub(1, Ordering::Release);
+        warn!(service = %args.service.name, max_pool, "mux 连接已达上限, 忽略 CreateDataMux");
+        return Ok(());
+    }
+    let _guard = MuxActiveGuard { active };
+
+    let conn = do_data_channel_handshake(args.clone(), DataChannelMode::Mux).await?;
+    let mut cfg = YamuxConfig::default();
+    let yamux_conn = YamuxConnection::new(conn.compat(), cfg, YamuxMode::Client);
+    run_mux_client(yamux_conn, args.service.clone()).await?;
+    Ok(())
+}
+
+async fn run_mux_client<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut conn: YamuxConnection<T>,
+    service: ClientServiceConfig,
+) -> Result<()> {
+    loop {
+        let inbound = poll_fn(|cx| conn.poll_next_inbound(cx)).await;
+        match inbound {
+            Some(Ok(stream)) => {
+                let service_clone = service.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_mux_stream(stream, service_clone).await {
+                        warn!("{:#}", e);
+                    }
+                });
+            }
+            Some(Err(e)) => {
+                warn!("mux 连接错误: {}", e);
+                break;
+            }
+            None => {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_mux_stream(stream: yamux::Stream, service: ClientServiceConfig) -> Result<()> {
+    let mut stream = stream.compat();
+    match read_data_cmd(&mut stream).await? {
+        DataChannelCmd::StartForwardTcp => {
+            if service.service_type != ServiceType::Tcp {
+                bail!("Expect TCP traffic. Please check the configuration.")
+            }
+            run_data_channel_for_tcp(stream, &service.local_addr).await?;
+        }
+        DataChannelCmd::StartForwardUdp => {
+            warn!(service = %service.name, "mux 暂不支持 UDP, 已拒绝");
+        }
+    }
     Ok(())
 }
 
@@ -392,6 +472,8 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    mux_active: Arc<AtomicUsize>,
+    mux_max_pool: usize,
 }
 
 // Handle of a control channel
@@ -477,6 +559,20 @@ impl<T: 'static + Transport> ControlChannel<T> {
                                 }
                             }.instrument(Span::current()));
                         },
+                        ControlChannelCmd::CreateDataMux => {
+                            if !self.service.enable_mux {
+                                warn!(service = %self.service.name, "mux 已禁用, 忽略 CreateDataMux");
+                                continue;
+                            }
+                            let args = data_ch_args.clone();
+                            let active = self.mux_active.clone();
+                            let max_pool = self.mux_max_pool;
+                            tokio::spawn(async move {
+                                if let Err(e) = run_data_mux(args, active, max_pool).await {
+                                    warn!("{:#}", e);
+                                }
+                            }.instrument(Span::current()));
+                        },
                         ControlChannelCmd::HeartBeat => ()
                     }
                 },
@@ -507,7 +603,11 @@ impl ControlChannelHandle {
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
+        let mux_active = Arc::new(AtomicUsize::new(0));
+        let mux_max_pool = service.mux_max_pool;
+
+        let retry_backoff_builder = run_control_chan_backoff(service.retry_interval.unwrap());
+        let mut retry_backoff = retry_backoff_builder.build();
 
         let mut s = ControlChannel {
             digest,
@@ -516,6 +616,8 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            mux_active,
+            mux_max_pool,
         };
 
         tokio::spawn(
@@ -533,15 +635,12 @@ impl ControlChannelHandle {
 
                     if start.elapsed() > Duration::from_secs(3) {
                         // The client runs for at least 3 secs and then disconnects
-                        retry_backoff.reset();
+                        retry_backoff = retry_backoff_builder.build();
                     }
 
-                    if let Some(duration) = retry_backoff.next_backoff() {
+                    if let Some(duration) = retry_backoff.next() {
                         error!("{:#}. Retry in {:?}...", err, duration);
                         time::sleep(duration).await;
-                    } else {
-                        // Should never reach
-                        panic!("{:#}. Break", err);
                     }
 
                     start = Instant::now();

@@ -23,7 +23,7 @@ const UDP_ACTIVITY_TIMEOUT: Duration = Duration::from_millis(300); // 测试缩�
 pub(super) async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    data_ch_req_tx: mpsc::Sender<bool>,
+    data_ch_req_tx: mpsc::Sender<super::DataChannelRequest>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10); // UDP Write Timeout
@@ -31,8 +31,8 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
     // 绑定UDP监听socket
     let l = retry_notify_with_deadline(
         crate::constants::listen_backoff(),
-        || async { Ok(UdpSocket::bind(&bind_addr).await?) },
-        |e, duration| {
+        || async { Ok::<UdpSocket, std::io::Error>(UdpSocket::bind(&bind_addr).await?) },
+        |e: &std::io::Error, duration| {
             warn!("{:#}. UDP 绑定错误 {:?}", e, duration);
         },
         &mut shutdown_rx,
@@ -57,7 +57,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                     }
                     Ok(Err(e)) => {
                         error!("发送开始传输命令失败: {},数据通道可能损坏,请求新通道", e);
-                        if let Err(e) = data_ch_req_tx.send(true).await {
+                        if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                             error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
                             break;
                         }
@@ -66,7 +66,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                     Err(_) => {
                         error!("发送开始传输命令超时,数据通道可能已损坏,请求新通道.");
                         // 请求新连接
-                        if let Err(e) = data_ch_req_tx.send(true).await {
+                        if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                             error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
                             break;
                         }
@@ -95,7 +95,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                 Ok(Err(e)) => {
                                     error!("写入UDP数据失败: {},数据通道可能损坏,请求新数据通道", e);
                                     // 连接失败，重建
-                                    if let Err(e) = data_ch_req_tx.send(true).await {
+                                    if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                         error!("请求新数据通道失败: {},关闭循环", e);
                                         break 'main_loop;
                                     }
@@ -104,7 +104,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                 Err(_) => {
                                     error!("写入UDP数据超时,数据通道可能损坏,请求新数据通道");
                                     // 连接失败，重建
-                                    if let Err(e) = data_ch_req_tx.send(true).await {
+                                    if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                         error!("请求新数据通道失败: {}", e);
                                         break 'main_loop;
                                     }
@@ -119,7 +119,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                             // 读取超时，检查整体活动超时
                             if last_activity.elapsed() > UDP_ACTIVITY_TIMEOUT {
                                 warn!("UDP连接已闲置超过5分钟，重新连接...");
-                                if let Err(e) = data_ch_req_tx.send(true).await {
+                                if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                     error!("请求新数据通道失败: {}", e);
                                     break 'main_loop;
                                 }
@@ -143,7 +143,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                 Ok(Err(e)) => {
                                     error!("从客户端接收UDP数据失败: {}", e);
                                     // 连接失败，重建
-                                    if let Err(e) = data_ch_req_tx.send(true).await {
+                                    if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                         error!("请求数据通道失败: {}", e);
                                         break 'main_loop;
                                     }
@@ -152,7 +152,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                 Err(_) => {
                                     error!("从客户端接收UDP数据失败, 连接失败，重建");
                                     // 连接失败，重建
-                                    if let Err(e) = data_ch_req_tx.send(true).await {
+                                    if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                         error!("请求数据通道失败: {}", e);
                                         break 'main_loop;
                                     }
@@ -163,7 +163,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                         Ok(Err(e)) => {
                             error!("UDP连接读取错误: {}", e);
                             // 连接失败，重建
-                            if let Err(e) = data_ch_req_tx.send(true).await {
+                            if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                 error!("请求数据通道失败: {}", e);
                                 break 'main_loop;
                             }
@@ -173,7 +173,10 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                             // 读取超时，检查整体活动超时
                             if last_activity.elapsed() > UDP_ACTIVITY_TIMEOUT {
                                 warn!("UDP 连接超时，重建...");
-                                if let Err(e) = data_ch_req_tx.send(true).await {
+                                if let Err(e) = data_ch_req_tx
+                                    .send(super::DataChannelRequest::Plain)
+                                    .await
+                                {
                                     error!("请求数据通道失败: {}", e);
                                     break 'main_loop;
                                 }
@@ -225,7 +228,7 @@ mod tests {
 
         let first_timeout = UDP_ACTIVITY_TIMEOUT + UDP_READ_TIMEOUT + UDP_READ_TIMEOUT;
         let first_req = timeout(first_timeout, data_ch_req_rx.recv()).await?;
-        assert_eq!(first_req, Some(true));
+        assert_eq!(first_req, Some(crate::server::DataChannelRequest::Plain));
 
         let (conn2, peer2) = duplex(1024);
         let _peer_guard2 = peer2;

@@ -17,6 +17,12 @@ const DEFAULT_MAX_INFLIGHT_HANDSHAKES: u64 = 512;
 
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
+const DEFAULT_ENABLE_MUX: bool = true;
+const DEFAULT_MUX_POOL_SIZE: usize = 2;
+const DEFAULT_MUX_MAX_STREAMS: usize = 256;
+const DEFAULT_MUX_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 360;
+const DEFAULT_MUX_MAX_POOL: usize = 4;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -68,6 +74,10 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
+    #[serde(default = "default_enable_mux")]
+    pub enable_mux: bool,
+    #[serde(default = "default_mux_max_pool")]
+    pub mux_max_pool: usize,
 }
 
 impl ClientServiceConfig {
@@ -88,8 +98,45 @@ pub enum ServiceType {
     Udp,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MuxSelect {
+    #[serde(rename = "least_streams")]
+    #[default]
+    LeastStreams,
+    #[serde(rename = "round_robin")]
+    RoundRobin,
+}
+
 fn default_service_type() -> ServiceType {
     Default::default()
+}
+
+fn default_enable_mux() -> bool {
+    DEFAULT_ENABLE_MUX
+}
+
+fn default_mux_pool_size() -> usize {
+    DEFAULT_MUX_POOL_SIZE
+}
+
+fn default_mux_max_streams() -> usize {
+    DEFAULT_MUX_MAX_STREAMS
+}
+
+fn default_mux_select() -> MuxSelect {
+    Default::default()
+}
+
+fn default_mux_idle_timeout() -> u64 {
+    DEFAULT_MUX_IDLE_TIMEOUT_SECS
+}
+
+fn default_stream_idle_timeout() -> u64 {
+    DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+}
+
+fn default_mux_max_pool() -> usize {
+    DEFAULT_MUX_MAX_POOL
 }
 
 /// Per service config
@@ -104,6 +151,18 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    #[serde(default = "default_enable_mux")]
+    pub enable_mux: bool,
+    #[serde(default = "default_mux_pool_size")]
+    pub mux_pool_size: usize,
+    #[serde(default = "default_mux_max_streams")]
+    pub mux_max_streams: usize,
+    #[serde(default = "default_mux_select")]
+    pub mux_select: MuxSelect,
+    #[serde(default = "default_mux_idle_timeout")]
+    pub mux_idle_timeout: u64,
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout: u64,
 }
 
 impl ServerServiceConfig {

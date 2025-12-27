@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
-use backoff::{backoff::Backoff, Notify};
+use backon::{BackoffBuilder, Retryable};
 use socket2::{SockRef, TcpKeepalive};
 use std::{future::Future, net::SocketAddr, time::Duration};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -139,13 +139,16 @@ pub async fn retry_notify_with_deadline<I, E, Fn, Fut, B, N>(
 ) -> Result<I>
 where
     E: std::error::Error + Send + Sync + 'static,
-    B: Backoff,
     Fn: FnMut() -> Fut,
-    Fut: Future<Output = std::result::Result<I, backoff::Error<E>>>,
-    N: Notify<E>,
+    Fut: Future<Output = std::result::Result<I, E>>,
+    B: BackoffBuilder + Copy,
+    N: FnMut(&E, Duration),
 {
     tokio::select! {
-        v = backoff::future::retry_notify(backoff, operation, notify) => {
+        v = operation
+            .retry(backoff)
+            .sleep(tokio::time::sleep)
+            .notify(notify) => {
             v.map_err(anyhow::Error::new)
         }
         _ = deadline.recv() => {

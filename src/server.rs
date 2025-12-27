@@ -10,8 +10,7 @@ use crate::protocol::{
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
-use backoff::backoff::Backoff;
-use backoff::ExponentialBackoff;
+use backon::{BackoffBuilder, ExponentialBuilder};
 
 use rand::RngCore;
 use std::collections::HashMap;
@@ -146,11 +145,13 @@ impl<T: 'static + Transport> Server<T> {
         info!("Listening at {}", self.config.bind_addr);
 
         // Retry at least every 100ms
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_millis(100),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
+        let backoff_builder = ExponentialBuilder::default()
+            .with_factor(1.5)
+            .with_min_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_millis(100))
+            .without_max_times()
+            .with_jitter();
+        let mut backoff = backoff_builder.build();
 
         // Wait for connections and shutdown signals
         loop {
@@ -164,20 +165,16 @@ impl<T: 'static + Transport> Server<T> {
                                 // If it is an IO error, then it's possibly an
                                 // EMFILE. So sleep for a while and retry
                                 // TODO: Only sleep for EMFILE, ENFILE, ENOMEM, ENOBUFS
-                                if let Some(d) = backoff.next_backoff() {
+                                if let Some(d) = backoff.next() {
                                     error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
                                     time::sleep(d).await;
-                                } else {
-                                    // This branch will never be executed according to the current retry policy
-                                    error!("Too many retries. Aborting...");
-                                    break;
                                 }
                             }
                             // If it's not an IO error, then it comes from
                             // the transport layer, so just ignore it
                         }
                         Ok((conn, addr)) => {
-                            backoff.reset();
+                            backoff = backoff_builder.build();
 
                             // Do transport handshake with a timeout
                             match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
@@ -552,11 +549,15 @@ fn tcp_listen_and_send(
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
     tokio::spawn(async move {
-        let l = retry_notify_with_deadline(listen_backoff(),  || async {
-            Ok(TcpListener::bind(&addr).await?)
-        }, |e, duration| {
+        let l = retry_notify_with_deadline(
+            listen_backoff(),
+            || async { Ok::<TcpListener, std::io::Error>(TcpListener::bind(&addr).await?) },
+            |e: &std::io::Error, duration| {
             error!("{:#}. Retry in {:?}", e, duration);
-        }, &mut shutdown_rx).await
+        },
+        &mut shutdown_rx,
+        )
+        .await
         .with_context(|| "Failed to listen for the service");
 
         let l: TcpListener = match l {
@@ -570,11 +571,13 @@ fn tcp_listen_and_send(
         info!("Listening at {}", &addr);
 
         // Retry at least every 1s
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_secs(1),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
+        let backoff_builder = ExponentialBuilder::default()
+            .with_factor(1.5)
+            .with_min_delay(Duration::from_millis(500))
+            .with_max_delay(Duration::from_secs(1))
+            .without_max_times()
+            .with_jitter();
+        let mut backoff = backoff_builder.build();
 
         // Wait for visitors and the shutdown signal
         loop {
@@ -585,12 +588,8 @@ fn tcp_listen_and_send(
                             // `l` is a TCP listener so this must be a IO error
                             // Possibly a EMFILE. So sleep for a while
                             error!("{}. Sleep for a while", e);
-                            if let Some(d) = backoff.next_backoff() {
+                            if let Some(d) = backoff.next() {
                                 time::sleep(d).await;
-                            } else {
-                                // This branch will never be reached for current backoff policy
-                                error!("Too many retries. Aborting...");
-                                break;
                             }
                         }
                         Ok((incoming, addr)) => {
@@ -601,7 +600,7 @@ fn tcp_listen_and_send(
                                 break;
                             }
 
-                            backoff.reset();
+                            backoff = backoff_builder.build();
 
                             debug!("New visitor from {}", addr);
 
@@ -667,8 +666,8 @@ async fn run_udp_connection_pool<T: Transport>(
 
     let l = retry_notify_with_deadline(
         listen_backoff(),
-        || async { Ok(UdpSocket::bind(&bind_addr).await?) },
-        |e, duration| {
+        || async { Ok::<UdpSocket, std::io::Error>(UdpSocket::bind(&bind_addr).await?) },
+        |e: &std::io::Error, duration| {
             warn!("{:#}. Retry in {:?}", e, duration);
         },
         &mut shutdown_rx,

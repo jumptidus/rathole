@@ -12,8 +12,9 @@ type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
 const _PROTO_V1: u8 = 1u8;
 pub const PROTO_V2: u8 = 2u8;
+pub const PROTO_V3: u8 = 3u8;
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V2;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
@@ -31,6 +32,7 @@ pub enum Ack {
     Ok,
     ServiceNotExist,
     AuthFailed,
+    RejectedDueToTimestamp,
 }
 
 impl std::fmt::Display for Ack {
@@ -42,6 +44,7 @@ impl std::fmt::Display for Ack {
                 Ack::Ok => "Ok",
                 Ack::ServiceNotExist => "Service not exist",
                 Ack::AuthFailed => "Incorrect token",
+                Ack::RejectedDueToTimestamp => "Rejected due to older timestamp",
             }
         )
     }
@@ -50,6 +53,7 @@ impl std::fmt::Display for Ack {
 #[derive(Deserialize, Serialize, Debug)]
 pub enum ControlChannelCmd {
     CreateDataChannel,
+    CreateDataMux,
     HeartBeat,
 }
 
@@ -57,6 +61,23 @@ pub enum ControlChannelCmd {
 pub enum DataChannelCmd {
     StartForwardTcp,
     StartForwardUdp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DataChannelMode {
+    Plain = 0,
+    Mux = 1,
+}
+
+impl DataChannelMode {
+    pub fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(DataChannelMode::Plain),
+            1 => Ok(DataChannelMode::Mux),
+            _ => bail!("未知的数据通道模式: {}", v),
+        }
+    }
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -158,8 +179,17 @@ impl PacketLength {
         let c_cmd =
             bincode::serialized_size(&ControlChannelCmd::CreateDataChannel).unwrap() as usize;
         let d_cmd = bincode::serialized_size(&DataChannelCmd::StartForwardTcp).unwrap() as usize;
-        let ack = Ack::Ok;
-        let ack = bincode::serialized_size(&ack).unwrap() as usize;
+        let ack_variants = [
+            Ack::Ok,
+            Ack::ServiceNotExist,
+            Ack::AuthFailed,
+            Ack::RejectedDueToTimestamp,
+        ];
+        let ack = ack_variants
+            .iter()
+            .map(|a| bincode::serialized_size(a).unwrap() as usize)
+            .max()
+            .unwrap();
 
         let auth = bincode::serialized_size(&Auth(d)).unwrap() as usize;
         PacketLength {
@@ -205,6 +235,26 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     }
 
     Ok(hello)
+}
+
+pub async fn read_data_channel_mode<T: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut T,
+) -> Result<DataChannelMode> {
+    let v = conn
+        .read_u8()
+        .await
+        .with_context(|| "Failed to read data channel mode")?;
+    DataChannelMode::from_u8(v)
+}
+
+pub async fn write_data_channel_mode<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    mode: DataChannelMode,
+) -> Result<()> {
+    conn.write_u8(mode as u8)
+        .await
+        .with_context(|| "Failed to write data channel mode")?;
+    Ok(())
 }
 
 pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {

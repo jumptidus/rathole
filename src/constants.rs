@@ -1,4 +1,4 @@
-use backoff::ExponentialBackoff;
+use backon::ExponentialBuilder;
 use std::time::Duration;
 
 // FIXME: Determine reasonable size
@@ -9,20 +9,20 @@ pub const UDP_TIMEOUT: u64 = 60;
 // TCP 空闲超时（秒）
 pub const TCP_IDLE_TIMEOUT: u64 = 30;
 
-pub fn listen_backoff() -> ExponentialBackoff {
-    ExponentialBackoff {
-        max_elapsed_time: None,
-        max_interval: Duration::from_secs(1),
-        ..Default::default()
-    }
+pub fn listen_backoff() -> ExponentialBuilder {
+    ExponentialBuilder::default()
+        .with_factor(1.5)
+        .with_min_delay(Duration::from_millis(500))
+        .with_max_delay(Duration::from_secs(1))
+        .without_max_times()
+        .with_jitter()
 }
 
-pub fn run_control_chan_backoff(max_interval: u64) -> ExponentialBackoff {
-    ExponentialBackoff {
-        randomization_factor: 0.2,
-        max_elapsed_time: None,
-        multiplier: 3.0,
-        max_interval: Duration::from_secs(max_interval), // 最大间隔时间
-        ..Default::default()
-    }
+pub fn run_control_chan_backoff(max_interval: u64) -> ExponentialBuilder {
+    ExponentialBuilder::default()
+        .with_factor(3.0)
+        .with_min_delay(Duration::from_millis(500))
+        .with_max_delay(Duration::from_secs(max_interval))
+        .without_max_times()
+        .with_jitter()
 }

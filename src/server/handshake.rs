@@ -492,9 +492,10 @@ mod tests {
     use crate::server::control::ControlChannelHandle;
     use crate::server::test_support::{build_service_config, TestTransport};
     use crate::server::ControlChannelMap;
+    use crate::protocol::{PROTO_V2, PROTO_V3};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncWriteExt};
     use tokio::sync::{broadcast, mpsc, RwLock};
     use tokio::time::timeout;
 
@@ -526,7 +527,8 @@ mod tests {
         let (conn, _peer) = duplex(64);
         let control_channels_for_task = control_channels.clone();
         let handshake_task = tokio::spawn(async move {
-            do_data_channel_handshake::<TestTransport>(conn, control_channels_for_task, nonce).await
+            do_data_channel_handshake::<TestTransport>(conn, control_channels_for_task, nonce, PROTO_V2)
+                .await
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -542,5 +544,42 @@ mod tests {
         let result = timeout(Duration::from_secs(1), handshake_task).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_v3_mux_mode_without_pool_is_ignored() {
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let (data_ch_tx, mut data_ch_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        let handle = ControlChannelHandle::new_for_test(
+            shutdown_tx,
+            data_ch_tx.clone(),
+            build_service_config(),
+            0,
+            "127.0.0.1:0".parse().unwrap(),
+        );
+
+        let nonce = [0u8; HASH_WIDTH_IN_BYTES];
+        let service_digest = [1u8; HASH_WIDTH_IN_BYTES];
+
+        {
+            let mut map = control_channels.write().await;
+            assert!(map.insert(service_digest, nonce, handle).is_ok());
+        }
+
+        let (mut client, server) = duplex(8);
+        client.write_u8(1).await.unwrap(); // DataChannelMode::Mux
+
+        let task = tokio::spawn(async move {
+            do_data_channel_handshake::<TestTransport>(server, control_channels, nonce, PROTO_V3)
+                .await
+                .unwrap();
+        });
+
+        let recv = timeout(Duration::from_millis(200), data_ch_rx.recv()).await;
+        assert!(recv.is_err());
+
+        task.await.unwrap();
     }
 }

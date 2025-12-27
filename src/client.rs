@@ -9,10 +9,10 @@ use crate::protocol::{
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
-use backon::ExponentialBuilder;
-use backon::Retryable;
+use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use bytes::{Bytes, BytesMut};
 use futures::future::poll_fn;
+use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
@@ -285,7 +285,7 @@ async fn run_data_mux<T: Transport>(
     Ok(())
 }
 
-async fn run_mux_client<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+async fn run_mux_client<T: FuturesAsyncRead + FuturesAsyncWrite + Unpin + Send + 'static>(
     mut conn: YamuxConnection<T>,
     service: ClientServiceConfig,
 ) -> Result<()> {

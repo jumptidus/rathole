@@ -36,7 +36,7 @@ type Nonce = protocol::Digest; // Also called `session_key`
 
 type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, control::ControlChannelHandle<T>>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataChannelRequest {
     Plain,
     Mux,

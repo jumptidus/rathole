@@ -23,6 +23,7 @@ pub struct MuxStream {
     in_use: Arc<AtomicUsize>,
     last_active: Arc<AtomicU64>,
     start: Instant,
+    notify: Arc<Notify>,
 }
 
 impl MuxStream {
@@ -31,12 +32,14 @@ impl MuxStream {
         in_use: Arc<AtomicUsize>,
         last_active: Arc<AtomicU64>,
         start: Instant,
+        notify: Arc<Notify>,
     ) -> Self {
         Self {
             inner,
             in_use,
             last_active,
             start,
+            notify,
         }
     }
 }
@@ -46,6 +49,7 @@ impl Drop for MuxStream {
         self.in_use.fetch_sub(1, Ordering::Release);
         let now_ms = self.start.elapsed().as_millis() as u64;
         self.last_active.store(now_ms, Ordering::Release);
+        self.notify.notify_waiters();
     }
 }
 
@@ -91,6 +95,7 @@ struct StreamPermit {
     last_active: Arc<AtomicU64>,
     start: Instant,
     released: bool,
+    notify: Arc<Notify>,
 }
 
 impl StreamPermit {
@@ -107,6 +112,7 @@ impl StreamPermit {
             last_active: Arc::clone(&session.last_active),
             start: session.start,
             released: false,
+            notify: Arc::clone(&session.notify),
         })
     }
 
@@ -117,6 +123,7 @@ impl StreamPermit {
             Arc::clone(&self.in_use),
             Arc::clone(&self.last_active),
             self.start,
+            Arc::clone(&self.notify),
         )
     }
 }
@@ -129,6 +136,7 @@ impl Drop for StreamPermit {
         self.in_use.fetch_sub(1, Ordering::Release);
         let now_ms = self.start.elapsed().as_millis() as u64;
         self.last_active.store(now_ms, Ordering::Release);
+        self.notify.notify_waiters();
     }
 }
 
@@ -140,10 +148,15 @@ pub(super) struct MuxSession {
     last_active: Arc<AtomicU64>,
     start: Instant,
     max_streams: usize,
+    notify: Arc<Notify>,
 }
 
 impl MuxSession {
-    fn new(open_tx: mpsc::Sender<OpenStreamRequest>, max_streams: usize) -> Arc<Self> {
+    fn new(
+        open_tx: mpsc::Sender<OpenStreamRequest>,
+        max_streams: usize,
+        notify: Arc<Notify>,
+    ) -> Arc<Self> {
         let start = Instant::now();
         Arc::new(Self {
             id: MUX_SESSION_ID.fetch_add(1, Ordering::Relaxed),
@@ -152,6 +165,7 @@ impl MuxSession {
             last_active: Arc::new(AtomicU64::new(0)),
             start,
             max_streams,
+            notify,
         })
     }
 
@@ -189,7 +203,7 @@ pub struct MuxPool {
     max_streams: usize,
     idle_timeout: Option<Duration>,
     request_tx: mpsc::Sender<DataChannelRequest>,
-    notify: Notify,
+    notify: Arc<Notify>,
     rr: AtomicUsize,
 }
 
@@ -206,6 +220,7 @@ impl MuxPool {
         } else {
             Some(Duration::from_secs(idle_timeout))
         };
+        let notify = Arc::new(Notify::new());
         Arc::new(Self {
             sessions: RwLock::new(Vec::new()),
             select,
@@ -213,7 +228,7 @@ impl MuxPool {
             max_streams,
             idle_timeout,
             request_tx,
-            notify: Notify::new(),
+            notify,
             rr: AtomicUsize::new(0),
         })
     }
@@ -230,7 +245,7 @@ impl MuxPool {
     }
 
     pub async fn add_session(&self, open_tx: mpsc::Sender<OpenStreamRequest>) -> Arc<MuxSession> {
-        let session = MuxSession::new(open_tx, self.max_streams);
+        let session = MuxSession::new(open_tx, self.max_streams, Arc::clone(&self.notify));
         self.sessions.write().await.push(session.clone());
         self.notify.notify_waiters();
         session
@@ -366,7 +381,7 @@ pub async fn run_mux_server<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Event::Open(req) => {
                 session.touch();
                 let stream = poll_fn(|cx| conn.poll_new_outbound(cx)).await;
-                let _ = req.resp.send(stream.map_err(|e| e));
+                let _ = req.resp.send(stream);
             }
             Event::Inbound(Some(Ok(_stream))) => {
                 session.touch();
@@ -392,4 +407,73 @@ pub async fn run_mux_server<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     pool.remove_session(session.id).await;
     pool.ensure_target().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{anyhow, Result};
+    use futures::future::poll_fn;
+    use std::sync::Arc;
+    use tokio::io::duplex;
+    use tokio::time::{sleep, timeout, Duration};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode as YamuxMode};
+
+    #[tokio::test]
+    async fn test_open_stream_waits_until_stream_released() -> Result<()> {
+        let (request_tx, mut request_rx) = mpsc::channel(8);
+        let pool = MuxPool::new(MuxSelect::LeastStreams, 1, 1, 0, request_tx);
+
+        let _request_drain = tokio::spawn(async move {
+            while request_rx.recv().await.is_some() {}
+        });
+
+        let (client_io, server_io) = duplex(1024);
+        let mut client =
+            YamuxConnection::new(client_io.compat(), YamuxConfig::default(), YamuxMode::Client);
+        let mut server =
+            YamuxConnection::new(server_io.compat(), YamuxConfig::default(), YamuxMode::Server);
+
+        let client_task = tokio::spawn(async move {
+            loop {
+                match poll_fn(|cx| client.poll_next_inbound(cx)).await {
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        });
+
+        let (open_tx, mut open_rx) = mpsc::channel(4);
+        let _session = pool.add_session(open_tx).await;
+
+        let server_task = tokio::spawn(async move {
+            while let Some(req) = open_rx.recv().await {
+                let stream = poll_fn(|cx| server.poll_new_outbound(cx)).await;
+                let _ = req.resp.send(stream.map_err(|e| e));
+            }
+        });
+
+        let first = pool.open_stream(Some(Duration::from_millis(200))).await?;
+        let pool_clone = Arc::clone(&pool);
+        let second_task = tokio::spawn(async move {
+            pool_clone.open_stream(Some(Duration::from_millis(200))).await
+        });
+
+        sleep(Duration::from_millis(20)).await;
+        assert!(!second_task.is_finished());
+
+        drop(first);
+
+        let second = timeout(Duration::from_millis(200), second_task)
+            .await
+            .map_err(|_| anyhow!("等待第二个 mux stream 超时"))?
+            .map_err(|e| anyhow!("第二个 mux stream 任务失败: {}", e))??;
+        drop(second);
+
+        server_task.abort();
+        client_task.abort();
+
+        Ok(())
+    }
 }

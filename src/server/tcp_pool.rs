@@ -232,9 +232,6 @@ where
         }
     }
 
-    let _ = left_to_right.await;
-    let _ = right_to_left.await;
-
     Ok(())
 }
 

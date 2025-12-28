@@ -10,7 +10,6 @@ use tracing::trace;
 
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
-const PROTO_V1: u8 = 1u8;
 pub const PROTO_V2: u8 = 2u8;
 pub const PROTO_V3: u8 = 3u8;
 
@@ -48,6 +47,12 @@ impl std::fmt::Display for Ack {
             }
         )
     }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub enum ControlChannelCmdV2 {
+    CreateDataChannel,
+    HeartBeat,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -219,21 +224,23 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
 
     match hello {
         Hello::ControlChannelHello(v, _) => {
-            // 服务端兼容v2和v1
-            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 && v != PROTO_V1 {
+            // 服务端兼容v3和v2
+            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 {
                 bail!(
-                    "协议版本不匹配. 期望 {}, 实际 {}. 请更新 `rathole`.",
+                    "协议版本不匹配. 期望 {} 或 {}, 实际 {}. 请更新 `rathole`.",
                     CURRENT_PROTO_VERSION,
+                    PROTO_V2,
                     v
                 );
             }
         }
         Hello::DataChannelHello(v, _) => {
-            // 服务端兼容v2和v1
-            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 && v != PROTO_V1 {
+            // 服务端兼容v3和v2
+            if v != CURRENT_PROTO_VERSION && v != PROTO_V2 {
                 bail!(
-                    "协议版本不匹配. 期望 {}, 实际 {}. 请更新 `rathole`.",
+                    "协议版本不匹配. 期望 {} 或 {}, 实际 {}. 请更新 `rathole`.",
                     CURRENT_PROTO_VERSION,
+                    PROTO_V2,
                     v
                 );
             }
@@ -300,4 +307,21 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
         .await
         .with_context(|| "Failed to read cmd")?;
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_control_cmd_v2_create_encoding() {
+        let bytes = bincode::serialize(&ControlChannelCmdV2::CreateDataChannel).unwrap();
+        assert_eq!(bytes, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_control_cmd_v2_heartbeat_encoding() {
+        let bytes = bincode::serialize(&ControlChannelCmdV2::HeartBeat).unwrap();
+        assert_eq!(bytes, vec![1, 0, 0, 0]);
+    }
 }

@@ -428,7 +428,22 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     debug!("Try to handshake a data channel");
 
     let mode = if protocol_version == PROTO_V3 {
-        protocol::read_data_channel_mode(&mut conn).await?
+        match timeout(
+            Duration::from_secs(HANDSHAKE_TIMEOUT),
+            protocol::read_data_channel_mode(&mut conn),
+        )
+        .await
+        {
+            Ok(Ok(mode)) => mode,
+            Ok(Err(e)) => {
+                error!("读取数据通道模式失败: {}", e);
+                return Err(e);
+            }
+            Err(_) => {
+                error!("读取数据通道模式超时");
+                bail!("读取数据通道模式超时");
+            }
+        }
     } else {
         DataChannelMode::Plain
     };

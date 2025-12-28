@@ -1,6 +1,6 @@
 use crate::config::{ServerServiceConfig, ServiceType};
 use crate::helper::write_and_flush;
-use crate::protocol::{Ack, ControlChannelCmd, PROTO_V3};
+use crate::protocol::{Ack, ControlChannelCmd, ControlChannelCmdV2, PROTO_V2, PROTO_V3};
 use crate::transport::{SocketOpts, Transport};
 use anyhow::{anyhow, Context, Result};
 use std::future::Future;
@@ -274,9 +274,19 @@ impl<T: Transport> ControlChannel<T> {
         }
         debug!("发送初始数据通道请求成功, 数量: {}", self.pool_size);
 
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel)?;
-        let create_mux_cmd = bincode::serialize(&ControlChannelCmd::CreateDataMux)?;
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat)?;
+        let (create_ch_cmd, create_mux_cmd, heartbeat) = if self.protocol_version == PROTO_V2 {
+            (
+                bincode::serialize(&ControlChannelCmdV2::CreateDataChannel)?,
+                None,
+                bincode::serialize(&ControlChannelCmdV2::HeartBeat)?,
+            )
+        } else {
+            (
+                bincode::serialize(&ControlChannelCmd::CreateDataChannel)?,
+                Some(bincode::serialize(&ControlChannelCmd::CreateDataMux)?),
+                bincode::serialize(&ControlChannelCmd::HeartBeat)?,
+            )
+        };
 
         loop {
             tokio::select! {
@@ -284,7 +294,9 @@ impl<T: Transport> ControlChannel<T> {
                     match val {
                         Some(req) => {
                             let cmd = match req {
-                                DataChannelRequest::Mux if self.mux_enabled && self.protocol_version == PROTO_V3 => &create_mux_cmd,
+                                DataChannelRequest::Mux if self.mux_enabled && self.protocol_version == PROTO_V3 => {
+                                    create_mux_cmd.as_ref().unwrap_or(&create_ch_cmd)
+                                }
                                 _ => &create_ch_cmd,
                             };
                             let write_future = self.write_and_flush(cmd);

@@ -466,6 +466,15 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
 
             match mode {
                 DataChannelMode::Plain => {
+                    if protocol_version == PROTO_V3 && mux_pool.is_some() {
+                        warn!("V3 TCP 不允许 Plain 数据通道, 已拒绝");
+                        let _ = timeout(
+                            Duration::from_secs(HANDSHAKE_TIMEOUT),
+                            conn.shutdown(),
+                        )
+                        .await;
+                        return Ok(());
+                    }
                     // Send the data channel to the corresponding control channel
                     data_ch_tx
                         .send(conn)
@@ -503,7 +512,9 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
 #[cfg(test)]
 mod tests {
     use super::do_data_channel_handshake;
+    use crate::config::MuxSelect;
     use crate::protocol::HASH_WIDTH_IN_BYTES;
+    use crate::server::mux::MuxPool;
     use crate::server::control::ControlChannelHandle;
     use crate::server::test_support::{build_service_config, TestTransport};
     use crate::server::ControlChannelMap;
@@ -526,6 +537,7 @@ mod tests {
             build_service_config(),
             0,
             "127.0.0.1:0".parse().unwrap(),
+            None,
         );
 
         let nonce = [0u8; HASH_WIDTH_IN_BYTES];
@@ -573,6 +585,7 @@ mod tests {
             build_service_config(),
             0,
             "127.0.0.1:0".parse().unwrap(),
+            None,
         );
 
         let nonce = [0u8; HASH_WIDTH_IN_BYTES];
@@ -585,6 +598,47 @@ mod tests {
 
         let (mut client, server) = duplex(8);
         client.write_u8(1).await.unwrap(); // DataChannelMode::Mux
+
+        let task = tokio::spawn(async move {
+            do_data_channel_handshake::<TestTransport>(server, control_channels, nonce, PROTO_V3)
+                .await
+                .unwrap();
+        });
+
+        let recv = timeout(Duration::from_millis(200), data_ch_rx.recv()).await;
+        assert!(recv.is_err());
+
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v3_plain_mode_with_mux_pool_is_rejected() {
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let (data_ch_tx, mut data_ch_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        let (req_tx, _req_rx) = mpsc::channel(1);
+        let mux_pool = MuxPool::new(MuxSelect::LeastStreams, 1, 1, 0, req_tx);
+
+        let handle = ControlChannelHandle::new_for_test(
+            shutdown_tx,
+            data_ch_tx.clone(),
+            build_service_config(),
+            0,
+            "127.0.0.1:0".parse().unwrap(),
+            Some(mux_pool),
+        );
+
+        let nonce = [0u8; HASH_WIDTH_IN_BYTES];
+        let service_digest = [1u8; HASH_WIDTH_IN_BYTES];
+
+        {
+            let mut map = control_channels.write().await;
+            assert!(map.insert(service_digest, nonce, handle).is_ok());
+        }
+
+        let (mut client, server) = duplex(8);
+        client.write_u8(0).await.unwrap(); // DataChannelMode::Plain
 
         let task = tokio::spawn(async move {
             do_data_channel_handshake::<TestTransport>(server, control_channels, nonce, PROTO_V3)

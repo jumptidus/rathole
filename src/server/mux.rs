@@ -1,6 +1,7 @@
 use crate::config::MuxSelect;
 use crate::server::DataChannelRequest;
 use anyhow::{anyhow, Result};
+use backon::{BackoffBuilder, ExponentialBuilder};
 use futures::future::poll_fn;
 use futures::io::{AsyncRead, AsyncWrite};
 use std::pin::Pin;
@@ -10,8 +11,8 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock};
-use tokio::time::timeout;
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock};
+use tokio::time::{sleep, timeout};
 use tracing::{error, warn};
 use yamux::{Connection, ConnectionError, Stream};
 
@@ -141,6 +142,33 @@ impl Drop for StreamPermit {
 }
 
 #[derive(Debug)]
+struct RequestBackoff {
+    builder: ExponentialBuilder,
+    backoff: backon::ExponentialBackoff,
+}
+
+impl RequestBackoff {
+    fn new() -> Self {
+        let builder = ExponentialBuilder::default()
+            .with_factor(1.5)
+            .with_min_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(5))
+            .without_max_times()
+            .with_jitter();
+        let backoff = builder.build();
+        Self { builder, backoff }
+    }
+
+    fn reset(&mut self) {
+        self.backoff = self.builder.build();
+    }
+
+    fn next_delay(&mut self) -> Option<Duration> {
+        self.backoff.next()
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct MuxSession {
     id: u64,
     open_tx: mpsc::Sender<OpenStreamRequest>,
@@ -205,6 +233,8 @@ pub struct MuxPool {
     request_tx: mpsc::Sender<DataChannelRequest>,
     notify: Arc<Notify>,
     rr: AtomicUsize,
+    request_lock: Mutex<()>,
+    request_backoff: Mutex<RequestBackoff>,
 }
 
 impl MuxPool {
@@ -230,14 +260,48 @@ impl MuxPool {
             request_tx,
             notify,
             rr: AtomicUsize::new(0),
+            request_lock: Mutex::new(()),
+            request_backoff: Mutex::new(RequestBackoff::new()),
         })
     }
 
     pub async fn ensure_target(&self) {
         let current = self.sessions.read().await.len();
         if current >= self.target {
+            let mut backoff = self.request_backoff.lock().await;
+            backoff.reset();
             return;
         }
+        let missing = self.target - current;
+        for _ in 0..missing {
+            let _ = self.request_tx.send(DataChannelRequest::Mux).await;
+        }
+    }
+
+    async fn ensure_target_with_backoff(&self) {
+        let _guard = self.request_lock.lock().await;
+        let current = self.sessions.read().await.len();
+        if current >= self.target {
+            self.request_backoff.lock().await.reset();
+            return;
+        }
+
+        let delay = self
+            .request_backoff
+            .lock()
+            .await
+            .next_delay()
+            .unwrap_or(Duration::from_millis(0));
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+
+        let current = self.sessions.read().await.len();
+        if current >= self.target {
+            self.request_backoff.lock().await.reset();
+            return;
+        }
+
         let missing = self.target - current;
         for _ in 0..missing {
             let _ = self.request_tx.send(DataChannelRequest::Mux).await;
@@ -247,6 +311,7 @@ impl MuxPool {
     pub async fn add_session(&self, open_tx: mpsc::Sender<OpenStreamRequest>) -> Arc<MuxSession> {
         let session = MuxSession::new(open_tx, self.max_streams, Arc::clone(&self.notify));
         self.sessions.write().await.push(session.clone());
+        self.request_backoff.lock().await.reset();
         self.notify.notify_waiters();
         session
     }
@@ -302,7 +367,7 @@ impl MuxPool {
                     }
                 }
 
-                self.ensure_target().await;
+                self.ensure_target_with_backoff().await;
                 self.notify.notified().await;
             }
         };

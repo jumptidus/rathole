@@ -17,7 +17,6 @@ const DEFAULT_MAX_INFLIGHT_HANDSHAKES: u64 = 512;
 
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
-const DEFAULT_ENABLE_MUX: bool = true;
 const DEFAULT_MUX_POOL_SIZE: usize = 4;
 const DEFAULT_MUX_MAX_STREAMS: usize = 256;
 const DEFAULT_MUX_IDLE_TIMEOUT_SECS: u64 = 300;
@@ -74,8 +73,6 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
-    #[serde(default = "default_enable_mux")]
-    pub enable_mux: bool,
     #[serde(default = "default_mux_max_pool")]
     pub mux_max_pool: usize,
 }
@@ -109,10 +106,6 @@ pub enum MuxSelect {
 
 fn default_service_type() -> ServiceType {
     Default::default()
-}
-
-fn default_enable_mux() -> bool {
-    DEFAULT_ENABLE_MUX
 }
 
 fn default_mux_pool_size() -> usize {
@@ -151,8 +144,6 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
-    #[serde(default = "default_enable_mux")]
-    pub enable_mux: bool,
     #[serde(default = "default_mux_pool_size")]
     pub mux_pool_size: usize,
     #[serde(default = "default_mux_max_streams")]

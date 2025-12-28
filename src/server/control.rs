@@ -50,9 +50,7 @@ where
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::channel(data_channel_request_buffer); // 缓冲区
 
         // 获得 TCP 或 UDP 的服务池大小
-        let mux_enabled = service.service_type == ServiceType::Tcp
-            && service.enable_mux
-            && protocol_version == PROTO_V3;
+        let mux_enabled = service.service_type == ServiceType::Tcp && protocol_version == PROTO_V3;
         let pool_size = match service.service_type {
             ServiceType::Tcp => {
                 if mux_enabled {
@@ -65,18 +63,13 @@ where
         };
 
         let mux_pool = if mux_enabled {
-            let pool = MuxPool::new(
+            Some(MuxPool::new(
                 service.mux_select,
                 service.mux_pool_size,
                 service.mux_max_streams,
                 service.mux_idle_timeout,
                 data_ch_req_tx.clone(),
-            );
-            let pool_clone = pool.clone();
-            tokio::spawn(async move {
-                pool_clone.ensure_target().await;
-            });
-            Some(pool)
+            ))
         } else {
             None
         };
@@ -206,6 +199,7 @@ where
         service: ServerServiceConfig,
         timestamp: u64,
         addr: SocketAddr,
+        mux_pool: Option<Arc<MuxPool>>,
     ) -> Self {
         ControlChannelHandle {
             _shutdown_tx: shutdown_tx,
@@ -213,7 +207,7 @@ where
             service,
             timestamp,
             addr,
-            mux_pool: None,
+            mux_pool,
         }
     }
 }

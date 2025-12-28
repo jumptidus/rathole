@@ -560,10 +560,6 @@ impl<T: 'static + Transport> ControlChannel<T> {
                             }.instrument(Span::current()));
                         },
                         ControlChannelCmd::CreateDataMux => {
-                            if !self.service.enable_mux {
-                                warn!(service = %self.service.name, "mux 已禁用, 忽略 CreateDataMux");
-                                continue;
-                            }
                             let args = data_ch_args.clone();
                             let active = self.mux_active.clone();
                             let max_pool = self.mux_max_pool;

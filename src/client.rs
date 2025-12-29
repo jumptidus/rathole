@@ -1,7 +1,7 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType, DEFAULT_MUX_MAX_STREAMS};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::data_channel_handler::get_data_channel_tcp_handler;
-use crate::data_channel_limit::get_data_channel_limiter;
+use crate::data_channel_limit::{get_data_channel_limiter, get_udp_port_limiter, DataChannelPermit};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
@@ -33,7 +33,7 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
-use crate::constants::{run_control_chan_backoff, TCP_IDLE_TIMEOUT, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
+use crate::constants::{run_control_chan_backoff, TCP_IDLE_TIMEOUT, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE};
 
 // The entrypoint of running a client
 pub async fn run_client(
@@ -241,7 +241,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service).await?;
         }
     }
     Ok(())
@@ -477,10 +477,16 @@ async fn handle_mux_stream(stream: yamux::Stream, service: ClientServiceConfig) 
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    service: &ClientServiceConfig,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
+    let udp_port_limiter = get_udp_port_limiter(&service.name);
+    let reject_counter = AtomicU64::new(0);
+    let udp_timeout = Duration::from_secs(service.udp_timeout);
 
     // The channel stores UdpTraffic that needs to be sent to the server
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
@@ -527,7 +533,26 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
             // grabbing the writer lock
             let mut m = port_map.write().await;
 
-            match udp_connect(local_addr).await {
+            let permit = if let Some(limiter) = udp_port_limiter.as_ref() {
+                match limiter.try_acquire() {
+                    Some(permit) => Some(permit),
+                    None => {
+                        let count = reject_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        if count % 100 == 1 {
+                            warn!(
+                                service = %service.name,
+                                "UDP 端口映射已达到上限, 已拒绝 {} 次",
+                                count
+                            );
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            match udp_connect(&service.local_addr).await {
                 Ok(s) => {
                     let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
                     m.insert(packet.from, inbound_tx);
@@ -537,6 +562,8 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
                         outbound_tx.clone(),
                         packet.from,
                         port_map.clone(),
+                        udp_timeout,
+                        permit,
                     ));
                 }
                 Err(e) => {
@@ -561,8 +588,11 @@ async fn run_udp_forwarder(
     outbound_tx: mpsc::Sender<UdpTraffic>,
     from: SocketAddr,
     port_map: UdpPortMap,
+    udp_timeout: Duration,
+    permit: Option<DataChannelPermit>,
 ) -> Result<()> {
     debug!("Forwarder created");
+    let _permit = permit;
     let mut buf = BytesMut::new();
     buf.resize(UDP_BUFFER_SIZE, 0);
 
@@ -592,8 +622,8 @@ async fn run_udp_forwarder(
                 outbound_tx.send(t).await?;
             },
 
-            // No traffic for the duration of UDP_TIMEOUT, clean up the state
-            _ = time::sleep(Duration::from_secs(UDP_TIMEOUT)) => {
+            // 超过 udp_timeout 未有流量则清理
+            _ = time::sleep(udp_timeout) => {
                 break;
             }
         }

@@ -18,8 +18,9 @@ const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 const DEFAULT_MUX_POOL_SIZE: usize = 4;
 pub(crate) const DEFAULT_MUX_MAX_STREAMS: usize = 1024;
 const DEFAULT_MUX_IDLE_TIMEOUT_SECS: u64 = 300;
-const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 360;
+const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MUX_MAX_POOL: usize = DEFAULT_MUX_POOL_SIZE;
+const DEFAULT_UDP_TIMEOUT_SECS: u64 = 10;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -73,12 +74,15 @@ pub struct ClientServiceConfig {
     pub retry_interval: Option<u64>,
     #[serde(default = "default_mux_max_pool")]
     pub mux_max_pool: usize,
+    #[serde(default = "default_udp_timeout")]
+    pub udp_timeout: u64,
 }
 
 impl ClientServiceConfig {
     pub fn with_name(name: &str) -> ClientServiceConfig {
         ClientServiceConfig {
             name: name.to_string(),
+            udp_timeout: default_udp_timeout(),
             ..Default::default()
         }
     }
@@ -128,6 +132,10 @@ fn default_stream_idle_timeout() -> u64 {
 
 fn default_mux_max_pool() -> usize {
     DEFAULT_MUX_MAX_POOL
+}
+
+fn default_udp_timeout() -> u64 {
+    DEFAULT_UDP_TIMEOUT_SECS
 }
 
 /// Per service config

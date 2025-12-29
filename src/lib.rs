@@ -18,7 +18,8 @@ pub use data_channel_handler::{
     DataChannelTcpHandler,
 };
 pub use data_channel_limit::{
-    register_data_channel_limiter, unregister_data_channel_limiter, DataChannelLimiter,
+    register_data_channel_limiter, udp_port_limiter_key, unregister_data_channel_limiter,
+    DataChannelLimiter,
 };
 
 use anyhow::Result;

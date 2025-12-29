@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::error;
 
+pub const UDP_PORT_LIMITER_SUFFIX: &str = "_udp_port";
+
 pub struct DataChannelLimiter {
     limit: AtomicUsize,
     in_use: AtomicUsize,
@@ -86,4 +88,12 @@ pub(crate) fn get_data_channel_limiter(service_name: &str) -> Option<Arc<DataCha
         poisoned.into_inner()
     });
     registry.get(service_name).cloned()
+}
+
+pub fn udp_port_limiter_key(service_name: &str) -> String {
+    format!("{}{}", service_name, UDP_PORT_LIMITER_SUFFIX)
+}
+
+pub(crate) fn get_udp_port_limiter(service_name: &str) -> Option<Arc<DataChannelLimiter>> {
+    get_data_channel_limiter(&udp_port_limiter_key(service_name))
 }

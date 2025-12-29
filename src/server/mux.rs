@@ -338,8 +338,12 @@ impl MuxPool {
         wait_timeout: Option<Duration>,
     ) -> Result<MuxStream> {
         let open = async {
+            let mut retries_left = 1usize;
+            let mut exclude_id = None;
+            let mut last_err: Option<anyhow::Error> = None;
+
             loop {
-                if let Some(session) = self.pick_session().await {
+                if let Some(session) = self.pick_session(exclude_id).await {
                     let Some(permit) = StreamPermit::new(&session) else {
                         continue;
                     };
@@ -351,20 +355,45 @@ impl MuxPool {
                         .await
                         .is_err()
                     {
-                        return Err(anyhow!("mux session channel closed"));
+                        let err = anyhow!("mux session channel closed");
+                        if retries_left > 0 {
+                            retries_left -= 1;
+                            exclude_id = Some(session.id);
+                            last_err = Some(err);
+                            continue;
+                        }
+                        return Err(err);
                     }
 
-                    match resp_rx.await {
+                    return match resp_rx.await {
                         Ok(Ok(stream)) => {
-                            return Ok(permit.into_stream(stream));
+                            Ok(permit.into_stream(stream))
                         }
                         Ok(Err(e)) => {
-                            return Err(anyhow!("open mux stream failed: {}", e));
+                            let err = anyhow!("open mux stream failed: {}", e);
+                            if retries_left > 0 {
+                                retries_left -= 1;
+                                exclude_id = Some(session.id);
+                                last_err = Some(err);
+                                continue;
+                            }
+                            Err(err)
                         }
                         Err(_) => {
-                            return Err(anyhow!("mux session dropped"));
+                            let err = anyhow!("mux session dropped");
+                            if retries_left > 0 {
+                                retries_left -= 1;
+                                exclude_id = Some(session.id);
+                                last_err = Some(err);
+                                continue;
+                            }
+                            Err(err)
                         }
                     }
+                }
+
+                if let Some(err) = last_err.take() {
+                    return Err(err);
                 }
 
                 self.ensure_target_with_backoff().await;
@@ -378,7 +407,7 @@ impl MuxPool {
         }
     }
 
-    async fn pick_session(&self) -> Option<Arc<MuxSession>> {
+    async fn pick_session(&self, exclude_id: Option<u64>) -> Option<Arc<MuxSession>> {
         let sessions = self.sessions.read().await;
         if sessions.is_empty() {
             return None;
@@ -387,7 +416,7 @@ impl MuxPool {
         match self.select {
             MuxSelect::LeastStreams => sessions
                 .iter()
-                .filter(|s| s.can_open())
+                .filter(|s| s.can_open() && exclude_id.is_none_or(|id| s.id != id))
                 .min_by_key(|s| s.inflight())
                 .cloned(),
             MuxSelect::RoundRobin => {
@@ -395,6 +424,9 @@ impl MuxPool {
                 for _ in 0..sessions.len() {
                     let s = &sessions[idx % sessions.len()];
                     idx += 1;
+                    if exclude_id.is_some_and(|id| s.id == id) {
+                        continue;
+                    }
                     if s.can_open() {
                         return Some(Arc::clone(s));
                     }
@@ -535,6 +567,53 @@ mod tests {
             .map_err(|_| anyhow!("等待第二个 mux stream 超时"))?
             .map_err(|e| anyhow!("第二个 mux stream 任务失败: {}", e))??;
         drop(second);
+
+        server_task.abort();
+        client_task.abort();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_open_stream_retries_next_session_on_channel_closed() -> Result<()> {
+        let (request_tx, mut request_rx) = mpsc::channel(8);
+        let pool = MuxPool::new(MuxSelect::LeastStreams, 1, 1, 0, request_tx);
+
+        let _request_drain = tokio::spawn(async move {
+            while request_rx.recv().await.is_some() {}
+        });
+
+        let (bad_tx, bad_rx) = mpsc::channel(1);
+        drop(bad_rx);
+        let _bad_session = pool.add_session(bad_tx).await;
+
+        let (client_io, server_io) = duplex(1024);
+        let mut client =
+            YamuxConnection::new(client_io.compat(), YamuxConfig::default(), YamuxMode::Client);
+        let mut server =
+            YamuxConnection::new(server_io.compat(), YamuxConfig::default(), YamuxMode::Server);
+
+        let client_task = tokio::spawn(async move {
+            loop {
+                match poll_fn(|cx| client.poll_next_inbound(cx)).await {
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        });
+
+        let (good_tx, mut good_rx) = mpsc::channel(4);
+        let _good_session = pool.add_session(good_tx).await;
+
+        let server_task = tokio::spawn(async move {
+            while let Some(req) = good_rx.recv().await {
+                let stream = poll_fn(|cx| server.poll_new_outbound(cx)).await;
+                let _ = req.resp.send(stream.map_err(|e| e));
+            }
+        });
+
+        let stream = pool.open_stream(Some(Duration::from_millis(200))).await?;
+        drop(stream);
 
         server_task.abort();
         client_task.abort();

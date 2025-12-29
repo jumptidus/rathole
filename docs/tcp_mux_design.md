@@ -180,7 +180,7 @@ enum DataChannelMode {
 
 ### 空闲超时
 
-- stream 空闲超时：默认沿用 `TCP_IDLE_TIMEOUT`（例如 360s），超时则关闭该 stream。
+- stream 空闲超时：默认沿用 `TCP_IDLE_TIMEOUT`（30s），超时则关闭该 stream。
 - mux 连接空闲超时：当 mux 下无活跃 stream 且超过 `mux_idle_timeout` 时关闭连接并允许重建。
 - yamux keepalive 建议开启，避免中间设备切断空闲连接。
 
@@ -234,22 +234,25 @@ fd_cost_per_service = mux_pool_size
 
 ### 服务端（建议新增）
 
+- 当前项目强约定 `mux_pool_size = 4`，不接受自定义配置。
 - `server.services.<name>.mux_pool_size`：每服务 data-mux 数量（默认 4）
-- `server.services.<name>.mux_max_streams`：每个 data-mux 的最大流数（默认 256）
+- 当前项目强约定 `mux_max_streams = 1024`，不接受自定义配置。
+- `server.services.<name>.mux_max_streams`：每个 data-mux 的最大流数（默认 1024）
 - `server.services.<name>.mux_select`：`least_streams` 或 `round_robin`
 - `server.services.<name>.mux_idle_timeout`：mux 空闲超时（默认 300s）
-- `server.services.<name>.stream_idle_timeout`：单 stream 空闲超时（默认 360s）
+- `server.services.<name>.stream_idle_timeout`：单 stream 空闲超时（默认 30s）
 - `server.services.<name>.yamux`：yamux 配置（详见下节）
 
 ### 客户端（建议新增）
 
+- 当前项目强约定 `mux_max_pool = 4`，不接受自定义配置。
 - `client.services.<name>.mux_max_pool`：客户端侧最大并发 data-mux 数（防止被误配置拉爆）
 
 ### Yamux 配置与推荐默认值
 
 ```text
 max_connection_receive_window = 1GiB (默认)
-max_num_streams = 512 (默认，服务端会按 mux_max_streams 覆盖)
+max_num_streams = 1024 (固定，与 mux_max_streams 一致)
 read_after_close = true
 split_send_size = 16KiB
 ```

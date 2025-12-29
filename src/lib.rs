@@ -14,13 +14,15 @@ use cli::KeypairType;
 pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
 pub use data_channel_handler::{
-    register_data_channel_tcp_handler, unregister_data_channel_tcp_handler, AsyncReadWrite,
-    DataChannelTcpHandler,
+    register_data_channel_tcp_handler, register_data_channel_udp_handler,
+    unregister_data_channel_tcp_handler, unregister_data_channel_udp_handler, AsyncReadWrite,
+    DataChannelTcpHandler, DataChannelUdpHandler,
 };
 pub use data_channel_limit::{
     register_data_channel_limiter, udp_port_limiter_key, unregister_data_channel_limiter,
     DataChannelLimiter,
 };
+pub use protocol::UdpTraffic;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};

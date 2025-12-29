@@ -1,28 +1,24 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType, DEFAULT_MUX_MAX_STREAMS};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
-use crate::data_channel_handler::get_data_channel_tcp_handler;
-use crate::data_channel_limit::{get_data_channel_limiter, get_udp_port_limiter, DataChannelPermit};
-use crate::helper::udp_connect;
+use crate::data_channel_handler::{get_data_channel_tcp_handler, get_data_channel_udp_handler};
+use crate::data_channel_limit::get_data_channel_limiter;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, write_data_channel_mode, Ack,
-    Auth, ControlChannelCmd, DataChannelCmd, DataChannelMode, UdpTraffic, CURRENT_PROTO_VERSION,
+    Auth, ControlChannelCmd, DataChannelCmd, DataChannelMode, CURRENT_PROTO_VERSION,
     HASH_WIDTH_IN_BYTES, PROTO_V3,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
-use bytes::{Bytes, BytesMut};
 use futures::future::poll_fn;
 use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
-use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode as YamuxMode};
 
@@ -33,7 +29,7 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
-use crate::constants::{run_control_chan_backoff, TCP_IDLE_TIMEOUT, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE};
+use crate::constants::run_control_chan_backoff;
 
 // The entrypoint of running a client
 pub async fn run_client(
@@ -247,38 +243,12 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
     Ok(())
 }
 
-// TCP 双向转发，带空闲超时控制
-async fn copy_with_activity<R, W>(
-    mut reader: R,
-    mut writer: W,
-    last_activity: Arc<AtomicU64>,
-    start: Instant,
-) -> io::Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = [0u8; 16 * 1024];
-    let mut total = 0u64;
-
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            let _ = writer.shutdown().await;
-            return Ok(total);
-        }
-        writer.write_all(&buf[..n]).await?;
-        total += n as u64;
-        last_activity.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
-    }
-}
-
-// TCP 双向转发（带空闲超时）
+// TCP 数据通道直连处理
 #[instrument(skip(conn))]
 async fn run_data_channel_for_tcp<S>(
     conn: S,
     service_name: &str,
-    local_addr: &str,
+    _local_addr: &str,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -288,105 +258,7 @@ where
     if let Some(handler) = get_data_channel_tcp_handler(service_name) {
         return handler(service_name, Box::new(conn)).await;
     }
-
-    let local = TcpStream::connect(local_addr)
-        .await
-        .with_context(|| format!("连接本地地址失败: {}", local_addr))?;
-
-    let (conn_rd, conn_wr) = io::split(conn);
-    let (local_rd, local_wr) = io::split(local);
-
-    let start = Instant::now();
-    let last_activity = Arc::new(AtomicU64::new(start.elapsed().as_millis() as u64));
-    let idle_timeout = Duration::from_secs(TCP_IDLE_TIMEOUT);
-    let idle_timeout_ms = idle_timeout.as_millis() as u64;
-
-    let mut client_to_local =
-        tokio::spawn(copy_with_activity(conn_rd, local_wr, last_activity.clone(), start));
-    let mut local_to_client =
-        tokio::spawn(copy_with_activity(local_rd, conn_wr, last_activity.clone(), start));
-
-    let idle_future = async {
-        let mut idle_ticker = time::interval(Duration::from_secs(1));
-        loop {
-            idle_ticker.tick().await;
-            let last_ms = last_activity.load(Ordering::Relaxed);
-            let now_ms = start.elapsed().as_millis() as u64;
-            if now_ms.saturating_sub(last_ms) >= idle_timeout_ms {
-                break;
-            }
-        }
-    };
-    tokio::pin!(idle_future);
-
-    let mut client_done = false;
-    let mut local_done = false;
-
-    loop {
-        tokio::select! {
-            res = &mut client_to_local, if !client_done => {
-                client_done = true;
-                match res {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(err)) => {
-                        debug!("数据通道转发失败: {}", err);
-                        if !local_done {
-                            local_to_client.abort();
-                            local_done = true;
-                        }
-                    }
-                    Err(err) => {
-                        debug!("数据通道转发任务异常: {}", err);
-                        if !local_done {
-                            local_to_client.abort();
-                            local_done = true;
-                        }
-                    }
-                }
-            }
-            res = &mut local_to_client, if !local_done => {
-                local_done = true;
-                match res {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(err)) => {
-                        debug!("数据通道转发失败: {}", err);
-                        if !client_done {
-                            client_to_local.abort();
-                            client_done = true;
-                        }
-                    }
-                    Err(err) => {
-                        debug!("数据通道转发任务异常: {}", err);
-                        if !client_done {
-                            client_to_local.abort();
-                            client_done = true;
-                        }
-                    }
-                }
-            }
-            _ = &mut idle_future => {
-                debug!("数据通道空闲超时({:?})，主动关闭", idle_timeout);
-                if !client_done {
-                    client_to_local.abort();
-                    client_done = true;
-                }
-                if !local_done {
-                    local_to_client.abort();
-                    local_done = true;
-                }
-                break;
-            }
-        }
-
-        if client_done && local_done {
-            break;
-        }
-    }
-
-    let _ = client_to_local.await;
-    let _ = local_to_client.await;
-
-    Ok(())
+    bail!("未注册 TCP 直连处理器: {}", service_name);
 }
 
 struct MuxActiveGuard {
@@ -470,12 +342,6 @@ async fn handle_mux_stream(stream: yamux::Stream, service: ClientServiceConfig) 
     Ok(())
 }
 
-// Things get a little tricker when it gets to UDP because it's connection-less.
-// A UdpPortMap must be maintained for recent seen incoming address, giving them
-// each a local port, which is associated with a socket. So just the sender
-// to the socket will work fine for the map's value.
-type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
-
 #[instrument(skip(conn))]
 async fn run_data_channel_for_udp<T: Transport>(
     conn: T::Stream,
@@ -483,157 +349,177 @@ async fn run_data_channel_for_udp<T: Transport>(
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
 
-    let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
-    let udp_port_limiter = get_udp_port_limiter(&service.name);
-    let reject_counter = AtomicU64::new(0);
-    let udp_timeout = Duration::from_secs(service.udp_timeout);
-
-    // The channel stores UdpTraffic that needs to be sent to the server
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
-
-    // FIXME: https://github.com/tokio-rs/tls/issues/40
-    // Maybe this is our concern
-    let (mut rd, mut wr) = io::split(conn);
-
-    // Keep sending items from the outbound channel to the server
-    tokio::spawn(async move {
-        while let Some(t) = outbound_rx.recv().await {
-            trace!("outbound {:?}", t);
-            if let Err(e) = t
-                .write(&mut wr)
-                .await
-                .with_context(|| "Failed to forward UDP traffic to the server")
-            {
-                debug!("{:?}", e);
-                break;
-            }
-        }
-    });
-
-    loop {
-        // Read a packet from the server
-        let hdr_len = rd.read_u8().await?;
-        let packet = UdpTraffic::read(&mut rd, hdr_len)
-            .await
-            .with_context(|| "Failed to read UDPTraffic from the server")?;
-        let m = port_map.read().await;
-
-        if m.get(&packet.from).is_none() {
-            // This packet is from a address we don't see for a while,
-            // which is not in the UdpPortMap.
-            // So set up a mapping (and a forwarder) for it
-
-            // Drop the reader lock
-            drop(m);
-
-            // Grab the writer lock
-            // This is the only thread that will try to grab the writer lock
-            // So no need to worry about some other thread has already set up
-            // the mapping between the gap of dropping the reader lock and
-            // grabbing the writer lock
-            let mut m = port_map.write().await;
-
-            let permit = if let Some(limiter) = udp_port_limiter.as_ref() {
-                match limiter.try_acquire() {
-                    Some(permit) => Some(permit),
-                    None => {
-                        let count = reject_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100 == 1 {
-                            warn!(
-                                service = %service.name,
-                                "UDP 端口映射已达到上限, 已拒绝 {} 次",
-                                count
-                            );
-                        }
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-
-            match udp_connect(&service.local_addr).await {
-                Ok(s) => {
-                    let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
-                    m.insert(packet.from, inbound_tx);
-                    tokio::spawn(run_udp_forwarder(
-                        s,
-                        inbound_rx,
-                        outbound_tx.clone(),
-                        packet.from,
-                        port_map.clone(),
-                        udp_timeout,
-                        permit,
-                    ));
-                }
-                Err(e) => {
-                    error!("{:#}", e);
-                }
-            }
-        }
-
-        // Now there should be a udp forwarder that can receive the packet
-        let m = port_map.read().await;
-        if let Some(tx) = m.get(&packet.from) {
-            let _ = tx.send(packet.data).await;
-        }
+    if let Some(handler) = get_data_channel_udp_handler(&service.name) {
+        return handler(service.clone(), Box::new(conn)).await;
     }
+    bail!("未注册 UDP 直连处理器: {}", service.name);
 }
 
-// Run a UdpSocket for the visitor `from`
-#[instrument(skip_all, fields(from))]
-async fn run_udp_forwarder(
-    s: UdpSocket,
-    mut inbound_rx: mpsc::Receiver<Bytes>,
-    outbound_tx: mpsc::Sender<UdpTraffic>,
-    from: SocketAddr,
-    port_map: UdpPortMap,
-    udp_timeout: Duration,
-    permit: Option<DataChannelPermit>,
-) -> Result<()> {
-    debug!("Forwarder created");
-    let _permit = permit;
-    let mut buf = BytesMut::new();
-    buf.resize(UDP_BUFFER_SIZE, 0);
-
-    loop {
-        tokio::select! {
-            // Receive from the server
-            data = inbound_rx.recv() => {
-                if let Some(data) = data {
-                    s.send(&data).await?;
-                } else {
-                    break;
-                }
-            },
-
-            // Receive from the service
-            val = s.recv(&mut buf) => {
-                let len = match val {
-                    Ok(v) => v,
-                    Err(_) => break
-                };
-
-                let t = UdpTraffic{
-                    from,
-                    data: Bytes::copy_from_slice(&buf[..len])
-                };
-
-                outbound_tx.send(t).await?;
-            },
-
-            // 超过 udp_timeout 未有流量则清理
-            _ = time::sleep(udp_timeout) => {
-                break;
+fn ensure_data_channel_handler(service: &ClientServiceConfig) -> Result<()> {
+    match service.service_type {
+        ServiceType::Tcp => {
+            if get_data_channel_tcp_handler(&service.name).is_none() {
+                bail!("未注册 TCP 直连处理器: {}", service.name);
+            }
+        }
+        ServiceType::Udp => {
+            if get_data_channel_udp_handler(&service.name).is_none() {
+                bail!("未注册 UDP 直连处理器: {}", service.name);
             }
         }
     }
-
-    let mut port_map = port_map.write().await;
-    port_map.remove(&from);
-
-    debug!("Forwarder dropped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_channel_handler::{
+        unregister_data_channel_tcp_handler, unregister_data_channel_udp_handler,
+    };
+    use crate::config::TransportConfig;
+    use crate::transport::{AddrMaybeCached, SocketOpts, Transport};
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{duplex, ReadBuf};
+
+    struct TestStream {
+        inner: tokio::io::DuplexStream,
+    }
+
+    impl TestStream {
+        fn new(inner: tokio::io::DuplexStream) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl std::fmt::Debug for TestStream {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("TestStream")
+        }
+    }
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DummyTransport;
+
+    #[async_trait]
+    impl Transport for DummyTransport {
+        type Acceptor = ();
+        type RawStream = ();
+        type Stream = TestStream;
+
+        fn new(_config: &TransportConfig) -> Result<Self> {
+            Ok(Self)
+        }
+
+        fn hint(_conn: &Self::Stream, _opts: SocketOpts) {}
+
+        async fn bind<T: tokio::net::ToSocketAddrs + Send + Sync>(
+            &self,
+            _addr: T,
+        ) -> Result<Self::Acceptor> {
+            Err(anyhow!("测试用 DummyTransport 不支持 bind"))
+        }
+
+        async fn accept(&self, _a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)> {
+            Err(anyhow!("测试用 DummyTransport 不支持 accept"))
+        }
+
+        async fn handshake(&self, _conn: Self::RawStream) -> Result<Self::Stream> {
+            Err(anyhow!("测试用 DummyTransport 不支持 handshake"))
+        }
+
+        async fn connect(&self, _addr: &AddrMaybeCached) -> Result<Self::Stream> {
+            Err(anyhow!("测试用 DummyTransport 不支持 connect"))
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_handler_missing_fast_fail() {
+        let service_name = "test_tcp_handler_missing_fast_fail";
+        let _ = unregister_data_channel_tcp_handler(service_name);
+
+        let (client, _server) = duplex(64);
+        let res = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_data_channel_for_tcp(client, service_name, "127.0.0.1:0"),
+        )
+        .await
+        .expect("测试超时");
+
+        let err = res.expect_err("应快速失败");
+        assert!(
+            err.to_string().contains("未注册 TCP 直连处理器"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_handler_missing_fast_fail() {
+        let service_name = "test_udp_handler_missing_fast_fail";
+        let _ = unregister_data_channel_udp_handler(service_name);
+
+        let service = ClientServiceConfig {
+            service_type: ServiceType::Udp,
+            name: service_name.to_string(),
+            local_addr: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        };
+        let (client, _server) = duplex(64);
+        let conn = TestStream::new(client);
+
+        let res = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_data_channel_for_udp::<DummyTransport>(conn, &service),
+        )
+        .await
+        .expect("测试超时");
+
+        let err = res.expect_err("应快速失败");
+        assert!(
+            err.to_string().contains("未注册 UDP 直连处理器"),
+            "unexpected error: {}",
+            err
+        );
+    }
 }
 
 // Control channel, using T as the transport layer
@@ -735,6 +621,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
                     debug!( "Received {:?}", val);
                     match val {
                         ControlChannelCmd::CreateDataChannel => {
+                            ensure_data_channel_handler(&self.service)?;
                             let args = data_ch_args.clone();
                             if let Some(limiter) = get_data_channel_limiter(&self.service.name) {
                                 if let Some(permit) = limiter.try_acquire() {
@@ -767,6 +654,10 @@ impl<T: 'static + Transport> ControlChannel<T> {
                             }
                         },
                         ControlChannelCmd::CreateDataMux => {
+                            if self.service.service_type != ServiceType::Tcp {
+                                bail!("mux 仅支持 TCP 服务: {}", self.service.name);
+                            }
+                            ensure_data_channel_handler(&self.service)?;
                             let args = data_ch_args.clone();
                             let active = self.mux_active.clone();
                             let max_pool = self.mux_max_pool;

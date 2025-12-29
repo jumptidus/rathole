@@ -15,12 +15,11 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
-const DEFAULT_ENABLE_MUX: bool = true;
-const DEFAULT_MUX_POOL_SIZE: usize = 2;
-const DEFAULT_MUX_MAX_STREAMS: usize = 256;
+const DEFAULT_MUX_POOL_SIZE: usize = 4;
+pub(crate) const DEFAULT_MUX_MAX_STREAMS: usize = 1024;
 const DEFAULT_MUX_IDLE_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 360;
-const DEFAULT_MUX_MAX_POOL: usize = 4;
+const DEFAULT_MUX_MAX_POOL: usize = DEFAULT_MUX_POOL_SIZE;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -72,8 +71,6 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
-    #[serde(default = "default_enable_mux")]
-    pub enable_mux: bool,
     #[serde(default = "default_mux_max_pool")]
     pub mux_max_pool: usize,
 }
@@ -107,10 +104,6 @@ pub enum MuxSelect {
 
 fn default_service_type() -> ServiceType {
     Default::default()
-}
-
-fn default_enable_mux() -> bool {
-    DEFAULT_ENABLE_MUX
 }
 
 fn default_mux_pool_size() -> usize {
@@ -149,8 +142,6 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
-    #[serde(default = "default_enable_mux")]
-    pub enable_mux: bool,
     #[serde(default = "default_mux_pool_size")]
     pub mux_pool_size: usize,
     #[serde(default = "default_mux_max_streams")]
@@ -321,6 +312,22 @@ impl Config {
                     bail!("The token of service {} is not set", name);
                 }
             }
+            if s.service_type == ServiceType::Tcp && s.mux_pool_size != DEFAULT_MUX_POOL_SIZE {
+                bail!(
+                    "服务 {} 的 mux_pool_size 必须为 {}, 当前为 {}",
+                    name,
+                    DEFAULT_MUX_POOL_SIZE,
+                    s.mux_pool_size
+                );
+            }
+            if s.service_type == ServiceType::Tcp && s.mux_max_streams != DEFAULT_MUX_MAX_STREAMS {
+                bail!(
+                    "服务 {} 的 mux_max_streams 必须为 {}, 当前为 {}",
+                    name,
+                    DEFAULT_MUX_MAX_STREAMS,
+                    s.mux_max_streams
+                );
+            }
         }
 
         Config::validate_transport_config(&server.transport, true)?;
@@ -340,6 +347,14 @@ impl Config {
             }
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
+            }
+            if s.service_type == ServiceType::Tcp && s.mux_max_pool != DEFAULT_MUX_MAX_POOL {
+                bail!(
+                    "服务 {} 的 mux_max_pool 必须为 {}, 当前为 {}",
+                    name,
+                    DEFAULT_MUX_MAX_POOL,
+                    s.mux_max_pool
+                );
             }
         }
 

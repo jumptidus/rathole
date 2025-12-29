@@ -1,4 +1,4 @@
-use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
+use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType, DEFAULT_MUX_MAX_STREAMS};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::data_channel_handler::get_data_channel_tcp_handler;
 use crate::data_channel_limit::get_data_channel_limiter;
@@ -418,6 +418,7 @@ async fn run_data_mux<T: Transport>(
 
     let conn = do_data_channel_handshake(args.clone(), DataChannelMode::Mux).await?;
     let mut cfg = YamuxConfig::default();
+    cfg.set_max_num_streams(DEFAULT_MUX_MAX_STREAMS);
     let yamux_conn = YamuxConnection::new(conn.compat(), cfg, YamuxMode::Client);
     run_mux_client(yamux_conn, args.service.clone()).await?;
     Ok(())
@@ -736,10 +737,6 @@ impl<T: 'static + Transport> ControlChannel<T> {
                             }
                         },
                         ControlChannelCmd::CreateDataMux => {
-                            if !self.service.enable_mux {
-                                warn!(service = %self.service.name, "mux 已禁用, 忽略 CreateDataMux");
-                                continue;
-                            }
                             let args = data_ch_args.clone();
                             let active = self.mux_active.clone();
                             let max_pool = self.mux_max_pool;

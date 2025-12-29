@@ -206,6 +206,30 @@ lazy_static! {
     static ref PACKET_LEN: PacketLength = PacketLength::new();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{Ack, PacketLength};
+
+    #[test]
+    fn test_ack_rejected_due_to_timestamp_serialization() {
+        let bytes = bincode::serialize(&Ack::RejectedDueToTimestamp).unwrap();
+        let ack: Ack = bincode::deserialize(&bytes).unwrap();
+        assert!(matches!(ack, Ack::RejectedDueToTimestamp));
+    }
+
+    #[test]
+    fn test_ack_packet_len_uses_max_variant() {
+        let sizes = [
+            bincode::serialized_size(&Ack::Ok).unwrap() as usize,
+            bincode::serialized_size(&Ack::ServiceNotExist).unwrap() as usize,
+            bincode::serialized_size(&Ack::AuthFailed).unwrap() as usize,
+            bincode::serialized_size(&Ack::RejectedDueToTimestamp).unwrap() as usize,
+        ];
+        let expect = *sizes.iter().max().unwrap();
+        let packet = PacketLength::new();
+        assert_eq!(packet.ack, expect);
+    }
+}
 pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Hello> {
     let mut buf = vec![0u8; PACKET_LEN.hello];
     conn.read_exact(&mut buf)

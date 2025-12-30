@@ -3,6 +3,7 @@ use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::protocol::{DataChannelCmd, UdpTraffic};
 use crate::transport::Transport;
 use anyhow::{Context, Result};
+use backon::{BackoffBuilder, ExponentialBuilder};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
@@ -45,38 +46,72 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp)?;
     let mut buf = [0u8; UDP_BUFFER_SIZE];
 
+    let backoff_builder = ExponentialBuilder::default()
+        .with_factor(1.5)
+        .with_min_delay(Duration::from_millis(100))
+        .with_max_delay(Duration::from_secs(5))
+        .without_max_times()
+        .with_jitter();
+    let mut request_backoff = backoff_builder.build();
+    let mut request_sleep = tokio::time::sleep(Duration::from_millis(0));
+    tokio::pin!(request_sleep);
+
     // 主循环：管理连接和数据转发
     'main_loop: loop {
         // 获取或重建数据通道连接
-        let mut conn = match data_ch_rx.recv().await {
-            Some(mut c) => {
-                match timeout(UDP_WRITE_TIMEOUT, write_and_flush(&mut c, &cmd)).await {
-                    Ok(Ok(_)) => {
-                        debug!("UDP 连接建立...");
-                        c
-                    }
-                    Ok(Err(e)) => {
-                        error!("发送开始传输命令失败: {},数据通道可能损坏,请求新通道", e);
-                        if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
-                            error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
-                            break;
+        request_sleep.as_mut().reset(Instant::now());
+        let mut conn = loop {
+            tokio::select! {
+                val = data_ch_rx.recv() => {
+                    match val {
+                        Some(mut c) => {
+                            match timeout(UDP_WRITE_TIMEOUT, write_and_flush(&mut c, &cmd)).await {
+                                Ok(Ok(_)) => {
+                                    debug!("UDP 连接建立...");
+                                    request_backoff = backoff_builder.build();
+                                    break c;
+                                }
+                                Ok(Err(e)) => {
+                                    error!("发送开始传输命令失败: {},数据通道可能损坏,请求新通道", e);
+                                    if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
+                                        error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
+                                        break 'main_loop;
+                                    }
+                                    if let Some(delay) = request_backoff.next() {
+                                        request_sleep.as_mut().reset(Instant::now() + delay);
+                                    }
+                                }
+                                Err(_) => {
+                                    error!("发送开始传输命令超时,数据通道可能已损坏,请求新通道.");
+                                    if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
+                                        error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
+                                        break 'main_loop;
+                                    }
+                                    if let Some(delay) = request_backoff.next() {
+                                        request_sleep.as_mut().reset(Instant::now() + delay);
+                                    }
+                                }
+                            }
                         }
-                        continue;
-                    }
-                    Err(_) => {
-                        error!("发送开始传输命令超时,数据通道可能已损坏,请求新通道.");
-                        // 请求新连接
-                        if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
-                            error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
-                            break;
+                        None => {
+                            error!("数据通道接收器已关闭");
+                            break 'main_loop;
                         }
-                        continue;
                     }
                 }
-            }
-            None => {
-                error!("数据通道接收器已关闭");
-                break;
+                _ = &mut request_sleep => {
+                    if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
+                        error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
+                        break 'main_loop;
+                    }
+                    if let Some(delay) = request_backoff.next() {
+                        request_sleep.as_mut().reset(Instant::now() + delay);
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    debug!("UDP 连接池收到关闭信号,正在关闭...");
+                    break 'main_loop;
+                }
             }
         };
 

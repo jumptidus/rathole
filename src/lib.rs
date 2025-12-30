@@ -60,13 +60,17 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
     crate::helper::feature_not_compile("nosie")
 }
 
+fn try_raise_fd_limit() {
+    let _ = std::panic::catch_unwind(fdlimit::raise_fd_limit);
+}
+
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     if args.genkey.is_some() {
         return genkey(args.genkey.unwrap());
     }
 
     // Raise `nofile` limit on linux and mac
-    fdlimit::raise_fd_limit();
+    try_raise_fd_limit();
 
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
     let config_path = args.config_path.as_ref().unwrap();

@@ -55,11 +55,11 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
     let mut request_backoff = backoff_builder.build();
     let mut request_sleep = tokio::time::sleep(Duration::from_millis(0));
     tokio::pin!(request_sleep);
+    let mut request_sleep_armed = false;
 
     // 主循环：管理连接和数据转发
     'main_loop: loop {
         // 获取或重建数据通道连接
-        request_sleep.as_mut().reset(Instant::now());
         let mut conn = loop {
             tokio::select! {
                 val = data_ch_rx.recv() => {
@@ -69,6 +69,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                 Ok(Ok(_)) => {
                                     debug!("UDP 连接建立...");
                                     request_backoff = backoff_builder.build();
+                                    request_sleep_armed = false;
                                     break c;
                                 }
                                 Ok(Err(e)) => {
@@ -79,6 +80,9 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                     }
                                     if let Some(delay) = request_backoff.next() {
                                         request_sleep.as_mut().reset(Instant::now() + delay);
+                                        request_sleep_armed = true;
+                                    } else {
+                                        request_sleep_armed = false;
                                     }
                                 }
                                 Err(_) => {
@@ -89,6 +93,9 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                     }
                                     if let Some(delay) = request_backoff.next() {
                                         request_sleep.as_mut().reset(Instant::now() + delay);
+                                        request_sleep_armed = true;
+                                    } else {
+                                        request_sleep_armed = false;
                                     }
                                 }
                             }
@@ -99,13 +106,16 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                         }
                     }
                 }
-                _ = &mut request_sleep => {
+                _ = &mut request_sleep, if request_sleep_armed => {
                     if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                         error!("请求新数据通道失败: {},控制通道可能已关闭.", e);
                         break 'main_loop;
                     }
                     if let Some(delay) = request_backoff.next() {
                         request_sleep.as_mut().reset(Instant::now() + delay);
+                        request_sleep_armed = true;
+                    } else {
+                        request_sleep_armed = false;
                     }
                 }
                 _ = shutdown_rx.recv() => {
@@ -134,6 +144,12 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                         error!("请求新数据通道失败: {},关闭循环", e);
                                         break 'main_loop;
                                     }
+                                    if let Some(delay) = request_backoff.next() {
+                                        request_sleep.as_mut().reset(Instant::now() + delay);
+                                        request_sleep_armed = true;
+                                    } else {
+                                        request_sleep_armed = false;
+                                    }
                                     break 'data_loop;
                                 },
                                 Err(_) => {
@@ -142,6 +158,12 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                     if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                         error!("请求新数据通道失败: {}", e);
                                         break 'main_loop;
+                                    }
+                                    if let Some(delay) = request_backoff.next() {
+                                        request_sleep.as_mut().reset(Instant::now() + delay);
+                                        request_sleep_armed = true;
+                                    } else {
+                                        request_sleep_armed = false;
                                     }
                                     break 'data_loop;
                                 }
@@ -157,6 +179,12 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                 if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                     error!("请求新数据通道失败: {}", e);
                                     break 'main_loop;
+                                }
+                                if let Some(delay) = request_backoff.next() {
+                                    request_sleep.as_mut().reset(Instant::now() + delay);
+                                    request_sleep_armed = true;
+                                } else {
+                                    request_sleep_armed = false;
                                 }
                                 break 'data_loop;
                             }
@@ -182,6 +210,12 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                         error!("请求数据通道失败: {}", e);
                                         break 'main_loop;
                                     }
+                                    if let Some(delay) = request_backoff.next() {
+                                        request_sleep.as_mut().reset(Instant::now() + delay);
+                                        request_sleep_armed = true;
+                                    } else {
+                                        request_sleep_armed = false;
+                                    }
                                     break 'data_loop;
                                 },
                                 Err(_) => {
@@ -190,6 +224,12 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                     if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                         error!("请求数据通道失败: {}", e);
                                         break 'main_loop;
+                                    }
+                                    if let Some(delay) = request_backoff.next() {
+                                        request_sleep.as_mut().reset(Instant::now() + delay);
+                                        request_sleep_armed = true;
+                                    } else {
+                                        request_sleep_armed = false;
                                     }
                                     break 'data_loop;
                                 }
@@ -201,6 +241,12 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                             if let Err(e) = data_ch_req_tx.send(super::DataChannelRequest::Plain).await {
                                 error!("请求数据通道失败: {}", e);
                                 break 'main_loop;
+                            }
+                            if let Some(delay) = request_backoff.next() {
+                                request_sleep.as_mut().reset(Instant::now() + delay);
+                                request_sleep_armed = true;
+                            } else {
+                                request_sleep_armed = false;
                             }
                             break 'data_loop;
                         },
@@ -214,6 +260,12 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                 {
                                     error!("请求数据通道失败: {}", e);
                                     break 'main_loop;
+                                }
+                                if let Some(delay) = request_backoff.next() {
+                                    request_sleep.as_mut().reset(Instant::now() + delay);
+                                    request_sleep_armed = true;
+                                } else {
+                                    request_sleep_armed = false;
                                 }
                                 break 'data_loop;
                             }
@@ -243,6 +295,31 @@ mod tests {
     use tokio::io::duplex;
     use tokio::sync::{broadcast, mpsc};
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn test_udp_pool_does_not_request_on_startup() -> Result<()> {
+        let (data_ch_tx, data_ch_rx) = mpsc::channel(4);
+        let (data_ch_req_tx, mut data_ch_req_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let pool_task = tokio::spawn(run_udp_connection_pool::<TestTransport>(
+            "127.0.0.1:0".to_string(),
+            data_ch_rx,
+            data_ch_req_tx,
+            shutdown_rx,
+        ));
+
+        let premature = timeout(Duration::from_millis(300), data_ch_req_rx.recv()).await;
+        assert!(premature.is_err());
+
+        let _ = shutdown_tx.send(true);
+        drop(data_ch_tx);
+
+        let result = timeout(Duration::from_secs(1), pool_task).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_ok());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_udp_idle_reconnect_resets_last_activity() -> Result<()> {

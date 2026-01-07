@@ -57,6 +57,35 @@ pub enum ControlChannelCmd {
     HeartBeat,
 }
 
+/// 固定 5 字节：kind(1) + max_pool(2) + active(2)
+pub const MUX_RESP_SIZE: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MuxRespKind {
+    Accepted = 0,
+    Rejected = 1,
+    Failed = 2,
+}
+
+impl MuxRespKind {
+    pub fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(MuxRespKind::Accepted),
+            1 => Ok(MuxRespKind::Rejected),
+            2 => Ok(MuxRespKind::Failed),
+            _ => bail!("未知的 mux 响应类型: {}", v),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ControlChannelMuxResp {
+    pub kind: MuxRespKind,
+    pub max_pool: u16,
+    pub active: u16,
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
     StartForwardTcp,
@@ -208,7 +237,8 @@ lazy_static! {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ack, PacketLength};
+    use super::{read_mux_resp, write_mux_resp, Ack, ControlChannelMuxResp, MuxRespKind, PacketLength};
+    use tokio::io::duplex;
 
     #[test]
     fn test_ack_rejected_due_to_timestamp_serialization() {
@@ -228,6 +258,21 @@ mod tests {
         let expect = *sizes.iter().max().unwrap();
         let packet = PacketLength::new();
         assert_eq!(packet.ack, expect);
+    }
+
+    #[tokio::test]
+    async fn test_mux_resp_roundtrip() {
+        let resp = ControlChannelMuxResp {
+            kind: MuxRespKind::Rejected,
+            max_pool: 16,
+            active: 8,
+        };
+        let (mut client, mut server) = duplex(64);
+        write_mux_resp(&mut client, &resp).await.unwrap();
+        let decoded = read_mux_resp(&mut server).await.unwrap();
+        assert_eq!(decoded.kind, resp.kind);
+        assert_eq!(decoded.max_pool, resp.max_pool);
+        assert_eq!(decoded.active, resp.active);
     }
 }
 pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Hello> {
@@ -281,6 +326,41 @@ pub async fn write_data_channel_mode<T: AsyncWrite + Unpin>(
     Ok(())
 }
 
+pub async fn write_mux_resp<T: AsyncWrite + Unpin>(
+    writer: &mut T,
+    resp: &ControlChannelMuxResp,
+) -> Result<()> {
+    let mut buf = [0u8; MUX_RESP_SIZE];
+    buf[0] = resp.kind as u8;
+    buf[1..3].copy_from_slice(&resp.max_pool.to_le_bytes());
+    buf[3..5].copy_from_slice(&resp.active.to_le_bytes());
+    writer
+        .write_all(&buf)
+        .await
+        .with_context(|| "Failed to write mux response")?;
+    writer
+        .flush()
+        .await
+        .with_context(|| "Failed to flush mux response")?;
+    Ok(())
+}
+
+pub async fn read_mux_resp<T: AsyncRead + Unpin>(reader: &mut T) -> Result<ControlChannelMuxResp> {
+    let mut buf = [0u8; MUX_RESP_SIZE];
+    reader
+        .read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read mux response")?;
+    let kind = MuxRespKind::from_u8(buf[0])?;
+    let max_pool = u16::from_le_bytes([buf[1], buf[2]]);
+    let active = u16::from_le_bytes([buf[3], buf[4]]);
+    Ok(ControlChannelMuxResp {
+        kind,
+        max_pool,
+        active,
+    })
+}
+
 pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {
     let mut buf = vec![0u8; PACKET_LEN.auth];
     conn.read_exact(&mut buf)
@@ -297,9 +377,7 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize ack")
 }
 
-pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<ControlChannelCmd> {
+pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<ControlChannelCmd> {
     let mut bytes = vec![0u8; PACKET_LEN.c_cmd];
     conn.read_exact(&mut bytes)
         .await

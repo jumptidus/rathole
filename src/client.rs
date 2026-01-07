@@ -4,9 +4,9 @@ use crate::data_channel_handler::{get_data_channel_tcp_handler, get_data_channel
 use crate::data_channel_limit::get_data_channel_limiter;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, read_ack, read_control_cmd, read_data_cmd, read_hello, write_data_channel_mode, Ack,
-    Auth, ControlChannelCmd, DataChannelCmd, DataChannelMode, CURRENT_PROTO_VERSION,
-    HASH_WIDTH_IN_BYTES, PROTO_V3,
+    self, read_ack, read_control_cmd, read_data_cmd, read_hello, write_data_channel_mode,
+    write_mux_resp, Ack, Auth, ControlChannelCmd, ControlChannelMuxResp, DataChannelCmd,
+    DataChannelMode, MuxRespKind, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES, PROTO_V3,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
@@ -271,29 +271,62 @@ impl Drop for MuxActiveGuard {
     }
 }
 
-async fn run_data_mux<T: Transport>(
+async fn run_data_mux_with_resp<T: Transport>(
     args: Arc<RunDataChannelArgs<T>>,
     active: Arc<AtomicU64>,
     max_pool: usize,
-) -> Result<()> {
+) -> ControlChannelMuxResp {
+    let max_pool_u16 = (max_pool as u64).min(u16::MAX as u64) as u16;
     let current = active.fetch_add(1, Ordering::AcqRel) as usize;
     if current >= max_pool {
         active.fetch_sub(1, Ordering::Release);
+        let active_u16 = active.load(Ordering::Acquire).min(u16::MAX as u64) as u16;
         warn!(
             service = %args.service.name,
             max_pool,
             "mux 连接已达上限, 忽略 CreateDataMux"
         );
-        return Ok(());
+        return ControlChannelMuxResp {
+            kind: MuxRespKind::Rejected,
+            max_pool: max_pool_u16,
+            active: active_u16,
+        };
     }
-    let _guard = MuxActiveGuard { active };
+    let active_for_resp = Arc::clone(&active);
+    let guard = MuxActiveGuard { active };
 
-    let conn = do_data_channel_handshake(args.clone(), DataChannelMode::Mux).await?;
+    let conn = match do_data_channel_handshake(args.clone(), DataChannelMode::Mux).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!(service = %args.service.name, "mux 握手失败: {:#}", e);
+            drop(guard);
+            let active_u16 =
+                active_for_resp.load(Ordering::Acquire).min(u16::MAX as u64) as u16;
+            return ControlChannelMuxResp {
+                kind: MuxRespKind::Failed,
+                max_pool: max_pool_u16,
+                active: active_u16,
+            };
+        }
+    };
+
     let mut cfg = YamuxConfig::default();
     cfg.set_max_num_streams(DEFAULT_MUX_MAX_STREAMS);
     let yamux_conn = YamuxConnection::new(conn.compat(), cfg, YamuxMode::Client);
-    run_mux_client(yamux_conn, args.service.clone()).await?;
-    Ok(())
+    let service = args.service.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        if let Err(e) = run_mux_client(yamux_conn, service).await {
+            warn!("{:#}", e);
+        }
+    });
+
+    let active_u16 = active_for_resp.load(Ordering::Acquire).min(u16::MAX as u64) as u16;
+    ControlChannelMuxResp {
+        kind: MuxRespKind::Accepted,
+        max_pool: max_pool_u16,
+        active: active_u16,
+    }
 }
 
 async fn run_mux_client<T: FuturesAsyncRead + FuturesAsyncWrite + Unpin + Send + 'static>(
@@ -614,14 +647,53 @@ impl<T: 'static + Transport> ControlChannel<T> {
             service: self.service.clone(),
         });
 
+        let (mut read_half, mut write_half) = tokio::io::split(conn);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (resp_tx, mut resp_rx) = mpsc::channel(64);
+
+        let reader_handle = tokio::spawn(async move {
+            loop {
+                match read_control_cmd(&mut read_half).await {
+                    Ok(cmd) => {
+                        if cmd_tx.send(cmd).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("读取控制指令失败: {:#}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let writer_handle = tokio::spawn(async move {
+            while let Some(resp) = resp_rx.recv().await {
+                if let Err(e) = write_mux_resp(&mut write_half, &resp).await {
+                    warn!("写入 mux 响应失败: {:#}", e);
+                    break;
+                }
+            }
+        });
+
+        let mut result = Ok(());
         loop {
             tokio::select! {
-                val = read_control_cmd(&mut conn) => {
-                    let val = val?;
+                val = cmd_rx.recv() => {
+                    let val = match val {
+                        Some(v) => v,
+                        None => {
+                            result = Err(anyhow!("控制指令通道已关闭"));
+                            break;
+                        }
+                    };
                     debug!( "Received {:?}", val);
                     match val {
                         ControlChannelCmd::CreateDataChannel => {
-                            ensure_data_channel_handler(&self.service)?;
+                            if let Err(e) = ensure_data_channel_handler(&self.service) {
+                                result = Err(e);
+                                break;
+                            }
                             let args = data_ch_args.clone();
                             if let Some(limiter) = get_data_channel_limiter(&self.service.name) {
                                 if let Some(permit) = limiter.try_acquire() {
@@ -655,23 +727,31 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         },
                         ControlChannelCmd::CreateDataMux => {
                             if self.service.service_type != ServiceType::Tcp {
-                                bail!("mux 仅支持 TCP 服务: {}", self.service.name);
+                                result = Err(anyhow!("mux 仅支持 TCP 服务: {}", self.service.name));
+                                break;
                             }
-                            ensure_data_channel_handler(&self.service)?;
+                            if let Err(e) = ensure_data_channel_handler(&self.service) {
+                                result = Err(e);
+                                break;
+                            }
                             let args = data_ch_args.clone();
                             let active = self.mux_active.clone();
                             let max_pool = self.mux_max_pool;
+                            let resp_tx = resp_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = run_data_mux(args, active, max_pool).await {
-                                    warn!("{:#}", e);
+                                let resp = run_data_mux_with_resp(args, active, max_pool).await;
+                                if let Err(e) = resp_tx.send(resp).await {
+                                    warn!("发送 mux 响应失败: {:#}", e);
                                 }
-                            }.instrument(Span::current()));
+                            }
+                            .instrument(Span::current()));
                         },
                         ControlChannelCmd::HeartBeat => ()
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
-                    return Err(anyhow!("Heartbeat timed out"))
+                    result = Err(anyhow!("Heartbeat timed out"));
+                    break;
                 }
                 _ = &mut self.shutdown_rx => {
                     break;
@@ -679,8 +759,11 @@ impl<T: 'static + Transport> ControlChannel<T> {
             }
         }
 
+        reader_handle.abort();
+        writer_handle.abort();
+
         info!("Control channel shutdown");
-        Ok(())
+        result
     }
 }
 

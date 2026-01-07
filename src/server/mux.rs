@@ -1,12 +1,14 @@
 use crate::config::MuxSelect;
+use crate::protocol::{ControlChannelMuxResp, MuxRespKind};
 use crate::server::DataChannelRequest;
 use anyhow::{anyhow, Result};
 use backon::{BackoffBuilder, ExponentialBuilder};
 use futures::future::poll_fn;
 use futures::io::{AsyncRead, AsyncWrite};
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::task::{Context, Poll};
@@ -17,6 +19,7 @@ use tracing::{error, warn};
 use yamux::{Connection, ConnectionError, Stream};
 
 static MUX_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_PENDING_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug)]
 pub struct MuxStream {
@@ -232,6 +235,10 @@ pub struct MuxPool {
     idle_timeout: Option<Duration>,
     request_tx: mpsc::Sender<DataChannelRequest>,
     notify: Arc<Notify>,
+    pending: AtomicUsize,
+    client_max_pool: AtomicU16,
+    pending_timeout: Duration,
+    pending_timestamps: Mutex<VecDeque<Instant>>,
     rr: AtomicUsize,
     request_lock: Mutex<()>,
     request_backoff: Mutex<RequestBackoff>,
@@ -259,30 +266,57 @@ impl MuxPool {
             idle_timeout,
             request_tx,
             notify,
+            pending: AtomicUsize::new(0),
+            client_max_pool: AtomicU16::new(u16::MAX),
+            pending_timeout: Duration::from_secs(DEFAULT_PENDING_TIMEOUT_SECS),
+            pending_timestamps: Mutex::new(VecDeque::new()),
             rr: AtomicUsize::new(0),
             request_lock: Mutex::new(()),
             request_backoff: Mutex::new(RequestBackoff::new()),
         })
     }
 
+    fn calc_effective_and_target(&self, sessions_len: usize) -> (usize, usize, usize) {
+        let pending = self.pending.load(Ordering::Acquire);
+        let effective = sessions_len + pending;
+        let client_limit = self.client_max_pool.load(Ordering::Acquire) as usize;
+        let actual_target = if client_limit == u16::MAX as usize {
+            self.target
+        } else {
+            self.target.min(client_limit)
+        };
+        (effective, actual_target, pending)
+    }
+
+    pub fn pending(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+
     pub async fn ensure_target(&self) {
-        let current = self.sessions.read().await.len();
-        if current >= self.target {
-            let mut backoff = self.request_backoff.lock().await;
-            backoff.reset();
+        let _guard = self.request_lock.lock().await;
+        self.cleanup_stale_pending().await;
+
+        let sessions_len = self.sessions.read().await.len();
+        let (effective, actual_target, pending) = self.calc_effective_and_target(sessions_len);
+        if pending > 0 || effective >= actual_target {
+            if effective >= actual_target {
+                self.request_backoff.lock().await.reset();
+            }
             return;
         }
-        let missing = self.target - current;
-        for _ in 0..missing {
-            let _ = self.request_tx.send(DataChannelRequest::Mux).await;
-        }
+        let _ = self.request_tx.send(DataChannelRequest::Mux).await;
     }
 
     async fn ensure_target_with_backoff(&self) {
         let _guard = self.request_lock.lock().await;
-        let current = self.sessions.read().await.len();
-        if current >= self.target {
-            self.request_backoff.lock().await.reset();
+        self.cleanup_stale_pending().await;
+
+        let sessions_len = self.sessions.read().await.len();
+        let (effective, actual_target, pending) = self.calc_effective_and_target(sessions_len);
+        if pending > 0 || effective >= actual_target {
+            if effective >= actual_target {
+                self.request_backoff.lock().await.reset();
+            }
             return;
         }
 
@@ -296,23 +330,26 @@ impl MuxPool {
             sleep(delay).await;
         }
 
-        let current = self.sessions.read().await.len();
-        if current >= self.target {
-            self.request_backoff.lock().await.reset();
+        self.cleanup_stale_pending().await;
+        let sessions_len = self.sessions.read().await.len();
+        let (effective, actual_target, pending) = self.calc_effective_and_target(sessions_len);
+        if pending > 0 || effective >= actual_target {
+            if effective >= actual_target {
+                self.request_backoff.lock().await.reset();
+            }
             return;
         }
 
-        let missing = self.target - current;
-        for _ in 0..missing {
-            let _ = self.request_tx.send(DataChannelRequest::Mux).await;
-        }
+        let _ = self.request_tx.send(DataChannelRequest::Mux).await;
     }
 
     pub async fn add_session(&self, open_tx: mpsc::Sender<OpenStreamRequest>) -> Arc<MuxSession> {
         let session = MuxSession::new(open_tx, self.max_streams, Arc::clone(&self.notify));
+        self.decrement_pending().await;
         self.sessions.write().await.push(session.clone());
         self.request_backoff.lock().await.reset();
         self.notify.notify_waiters();
+        self.ensure_target().await;
         session
     }
 
@@ -322,6 +359,91 @@ impl MuxPool {
 
     pub fn idle_timeout(&self) -> Option<Duration> {
         self.idle_timeout
+    }
+
+    pub async fn on_mux_request_sent(&self) {
+        self.pending.fetch_add(1, Ordering::Release);
+        let mut timestamps = self.pending_timestamps.lock().await;
+        timestamps.push_back(Instant::now());
+    }
+
+    pub async fn on_mux_resp(&self, resp: ControlChannelMuxResp) {
+        self.client_max_pool.store(resp.max_pool, Ordering::Release);
+        match resp.kind {
+            MuxRespKind::Accepted => {}
+            MuxRespKind::Rejected | MuxRespKind::Failed => {
+                if self.decrement_pending().await {
+                    self.notify.notify_waiters();
+                }
+            }
+        }
+    }
+
+    pub async fn cleanup_stale_pending(&self) {
+        let now = Instant::now();
+        let removed = {
+            let mut timestamps = self.pending_timestamps.lock().await;
+            let mut removed = 0usize;
+            while let Some(ts) = timestamps.front() {
+                if now.saturating_duration_since(*ts) >= self.pending_timeout {
+                    timestamps.pop_front();
+                    removed += 1;
+                } else {
+                    break;
+                }
+            }
+            removed
+        };
+        if removed == 0 {
+            return;
+        }
+        let dec = self.decrease_pending_by(removed);
+        if dec > 0 {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn decrement_pending(&self) -> bool {
+        let mut current = self.pending.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.pending.compare_exchange(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let mut timestamps = self.pending_timestamps.lock().await;
+                    if !timestamps.is_empty() {
+                        timestamps.pop_front();
+                    }
+                    return true;
+                }
+                Err(v) => current = v,
+            }
+        }
+    }
+
+    fn decrease_pending_by(&self, amount: usize) -> usize {
+        let mut current = self.pending.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return 0;
+            }
+            let dec = amount.min(current);
+            match self.pending.compare_exchange(
+                current,
+                current - dec,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return dec,
+                Err(v) => current = v,
+            }
+        }
     }
 
     pub async fn remove_session(&self, id: u64) {
@@ -397,7 +519,12 @@ impl MuxPool {
                 }
 
                 self.ensure_target_with_backoff().await;
-                self.notify.notified().await;
+                tokio::select! {
+                    _ = self.notify.notified() => {}
+                    _ = sleep(self.pending_timeout) => {
+                        self.cleanup_stale_pending().await;
+                    }
+                }
             }
         };
 
@@ -511,7 +638,9 @@ mod tests {
     use super::*;
     use anyhow::{anyhow, Result};
     use futures::future::poll_fn;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::time::Instant;
     use tokio::io::duplex;
     use tokio::time::{sleep, timeout, Duration};
     use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -618,6 +747,22 @@ mod tests {
         server_task.abort();
         client_task.abort();
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_pending_removes_expired() -> Result<()> {
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let pool = MuxPool::new(MuxSelect::LeastStreams, 1, 1, 0, request_tx);
+
+        pool.pending.store(1, Ordering::Release);
+        {
+            let mut timestamps = pool.pending_timestamps.lock().await;
+            timestamps.push_back(Instant::now() - Duration::from_secs(DEFAULT_PENDING_TIMEOUT_SECS + 1));
+        }
+
+        pool.cleanup_stale_pending().await;
+        assert_eq!(pool.pending.load(Ordering::Acquire), 0);
         Ok(())
     }
 }

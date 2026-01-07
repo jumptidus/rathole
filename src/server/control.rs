@@ -1,6 +1,8 @@
 use crate::config::{ServerServiceConfig, ServiceType};
 use crate::helper::write_and_flush;
-use crate::protocol::{Ack, ControlChannelCmd, ControlChannelCmdV2, PROTO_V2, PROTO_V3};
+use crate::protocol::{
+    read_mux_resp, Ack, ControlChannelCmd, ControlChannelCmdV2, PROTO_V2, PROTO_V3,
+};
 use crate::transport::{SocketOpts, Transport};
 use anyhow::{anyhow, Context, Result};
 use std::future::Future;
@@ -144,6 +146,7 @@ where
             data_ch_req_tx: data_ch_req_tx.clone(),
             mux_enabled,
             protocol_version,
+            mux_pool: mux_pool.clone(),
         };
 
         // 创建控制通道句柄实例（返回给调用者）
@@ -222,20 +225,17 @@ struct ControlChannel<T: Transport> {
     data_ch_req_tx: mpsc::Sender<DataChannelRequest>, // Sender to request data channels (Bounded Sender) // 发送器请求数据通道（有界发送器）
     mux_enabled: bool,
     protocol_version: u8,
+    mux_pool: Option<Arc<MuxPool>>,
 }
 
 impl<T: Transport> ControlChannel<T> {
-    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        write_and_flush(&mut self.conn, data)
-            .await
-            .with_context(|| "Failed to write control cmds")?;
-        Ok(())
-    }
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
+        let (mut read_half, mut write_half) = tokio::io::split(self.conn);
+
         // Send Ack::Ok as the first action
-        match self.write_and_flush(&bincode::serialize(&Ack::Ok)?).await {
+        match write_and_flush(&mut write_half, &bincode::serialize(&Ack::Ok)?).await {
             Ok(_) => {
                 info!("控制通道建立成功并已确认");
             }
@@ -245,28 +245,59 @@ impl<T: Transport> ControlChannel<T> {
             }
         }
 
+        let resp_handle = if let Some(pool) = self.mux_pool.clone() {
+            Some(tokio::spawn(async move {
+                loop {
+                    match read_mux_resp(&mut read_half).await {
+                        Ok(resp) => {
+                            pool.on_mux_resp(resp).await;
+                        }
+                        Err(e) => {
+                            debug!("读取 mux 响应失败: {:#}", e);
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            drop(read_half);
+            None
+        };
+
         // 发送初始数据通道请求...
         debug!(
             pool_size = self.pool_size,
             "发送初始数据通道请求..., 池大小: {}", self.pool_size
         );
-        let initial_req = if self.mux_enabled {
-            DataChannelRequest::Mux
-        } else {
-            DataChannelRequest::Plain
-        };
-        for i in 0..self.pool_size {
-            if let Err(e) = self.data_ch_req_tx.send(initial_req).await {
+        if self.mux_enabled {
+            if let Err(e) = self.data_ch_req_tx.send(DataChannelRequest::Mux).await {
                 error!(
-                    "发送初始数据通道请求失败 #{}/{}: {}, 控制通道关闭",
-                    i + 1,
-                    self.pool_size,
+                    "发送初始 mux 请求失败: {}, 控制通道关闭",
                     e
                 );
+                if let Some(handle) = resp_handle {
+                    handle.abort();
+                }
                 return Err(anyhow!("数据通道请求队列在初始化期间意外关闭: {}", e));
             }
+            debug!("发送初始 mux 请求成功");
+        } else {
+            for i in 0..self.pool_size {
+                if let Err(e) = self.data_ch_req_tx.send(DataChannelRequest::Plain).await {
+                    error!(
+                        "发送初始数据通道请求失败 #{}/{}: {}, 控制通道关闭",
+                        i + 1,
+                        self.pool_size,
+                        e
+                    );
+                    if let Some(handle) = resp_handle {
+                        handle.abort();
+                    }
+                    return Err(anyhow!("数据通道请求队列在初始化期间意外关闭: {}", e));
+                }
+            }
+            debug!("发送初始数据通道请求成功, 数量: {}", self.pool_size);
         }
-        debug!("发送初始数据通道请求成功, 数量: {}", self.pool_size);
 
         let (create_ch_cmd, create_mux_cmd, heartbeat) = if self.protocol_version == PROTO_V2 {
             (
@@ -282,27 +313,55 @@ impl<T: Transport> ControlChannel<T> {
             )
         };
 
+        let mut result = Ok(());
         loop {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(req) => {
-                            let cmd = match req {
+                            match req {
                                 DataChannelRequest::Mux if self.mux_enabled && self.protocol_version == PROTO_V3 => {
-                                    create_mux_cmd.as_ref().unwrap_or(&create_ch_cmd)
+                                    if let Some(pool) = &self.mux_pool {
+                                        if pool.pending() > 0 {
+                                            debug!("已有未完成的 mux 请求, 跳过本次请求");
+                                            continue;
+                                        }
+                                    }
+                                    let cmd = create_mux_cmd.as_ref().unwrap_or(&create_ch_cmd);
+                                    let write_future = write_and_flush(&mut write_half, cmd);
+                                    match time::timeout(Duration::from_secs(CONTROL_CHANNEL_WRITE_TIMEOUT), write_future).await {
+                                        Ok(Ok(_)) => {
+                                            if let Some(pool) = &self.mux_pool {
+                                                pool.on_mux_request_sent().await;
+                                            }
+                                        }
+                                        Ok(Err(e)) => {
+                                            error!("写入 创建数据通道 失败: {:#}", e);
+                                            result = Err(e);
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            error!("写入 创建数据通道 超时");
+                                            result = Err(anyhow!("写入 创建数据通道 超时"));
+                                            break;
+                                        }
+                                    }
                                 }
-                                _ => &create_ch_cmd,
-                            };
-                            let write_future = self.write_and_flush(cmd);
-                            match time::timeout(Duration::from_secs(CONTROL_CHANNEL_WRITE_TIMEOUT), write_future).await {
-                                Ok(Ok(_)) => {}, // 写入成功
-                                Ok(Err(e)) => {
-                                    error!("写入 创建数据通道 失败: {:#}", e);
-                                    break;
-                                }
-                                Err(_) => {
-                                    error!("写入 创建数据通道 超时");
-                                    break;
+                                _ => {
+                                    let write_future = write_and_flush(&mut write_half, &create_ch_cmd);
+                                    match time::timeout(Duration::from_secs(CONTROL_CHANNEL_WRITE_TIMEOUT), write_future).await {
+                                        Ok(Ok(_)) => {}, // 写入成功
+                                        Ok(Err(e)) => {
+                                            error!("写入 创建数据通道 失败: {:#}", e);
+                                            result = Err(e);
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            error!("写入 创建数据通道 超时");
+                                            result = Err(anyhow!("写入 创建数据通道 超时"));
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -312,15 +371,17 @@ impl<T: Transport> ControlChannel<T> {
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                    let write_future = self.write_and_flush(&heartbeat);
+                    let write_future = write_and_flush(&mut write_half, &heartbeat);
                     match time::timeout(Duration::from_secs(CONTROL_CHANNEL_WRITE_TIMEOUT), write_future).await {
                         Ok(Ok(_)) => {}, // 写入成功
                         Ok(Err(e)) => {
                             error!("写入心跳失败: {:#}", e);
+                            result = Err(e);
                             break;
                         }
                         Err(_) => {
                             error!("写入心跳超时");
+                            result = Err(anyhow!("写入心跳超时"));
                             break;
                         }
                     }
@@ -331,8 +392,12 @@ impl<T: Transport> ControlChannel<T> {
             }
         }
 
+        if let Some(handle) = resp_handle {
+            handle.abort();
+        }
+
         info!("控制通道关闭");
 
-        Ok(())
+        result
     }
 }

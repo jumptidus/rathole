@@ -22,6 +22,7 @@ const DEFAULT_MUX_MAX_STREAMS: usize = 1024;
 const DEFAULT_MUX_IDLE_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MUX_MAX_POOL: usize = DEFAULT_MUX_POOL_SIZE;
+const MAX_MUX_POOL_SIZE: usize = 12;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -326,11 +327,13 @@ impl Config {
                     bail!("The token of service {} is not set", name);
                 }
             }
-            if s.service_type == ServiceType::Tcp && s.mux_pool_size != DEFAULT_MUX_POOL_SIZE {
+            if s.service_type == ServiceType::Tcp
+                && (s.mux_pool_size == 0 || s.mux_pool_size > MAX_MUX_POOL_SIZE)
+            {
                 bail!(
-                    "服务 {} 的 mux_pool_size 必须为 {}, 当前为 {}",
+                    "服务 {} 的 mux_pool_size 必须在 1..={} 之间, 当前为 {}",
                     name,
-                    DEFAULT_MUX_POOL_SIZE,
+                    MAX_MUX_POOL_SIZE,
                     s.mux_pool_size
                 );
             }
@@ -366,11 +369,13 @@ impl Config {
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
             }
-            if s.service_type == ServiceType::Tcp && s.mux_max_pool != DEFAULT_MUX_MAX_POOL {
+            if s.service_type == ServiceType::Tcp
+                && (s.mux_max_pool == 0 || s.mux_max_pool > MAX_MUX_POOL_SIZE)
+            {
                 bail!(
-                    "服务 {} 的 mux_max_pool 必须为 {}, 当前为 {}",
+                    "服务 {} 的 mux_max_pool 必须在 1..={} 之间, 当前为 {}",
                     name,
-                    DEFAULT_MUX_MAX_POOL,
+                    MAX_MUX_POOL_SIZE,
                     s.mux_max_pool
                 );
             }

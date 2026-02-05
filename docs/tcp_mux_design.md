@@ -234,8 +234,7 @@ fd_cost_per_service = mux_pool_size
 
 ### 服务端（建议新增）
 
-- 当前项目强约定 `mux_pool_size = 4`，不接受自定义配置。
-- `server.services.<name>.mux_pool_size`：每服务 data-mux 数量（默认 4）
+- `server.services.<name>.mux_pool_size`：每服务 data-mux 数量（默认 4，允许范围 1..=12）
 - 当前项目强约定 `mux_max_streams = 1024`，不接受自定义配置。
 - `server.services.<name>.mux_max_streams`：每个 data-mux 的最大流数（默认 1024）
 - `server.services.<name>.mux_select`：`least_streams` 或 `round_robin`
@@ -245,8 +244,7 @@ fd_cost_per_service = mux_pool_size
 
 ### 客户端（建议新增）
 
-- 当前项目强约定 `mux_max_pool = 4`，不接受自定义配置。
-- `client.services.<name>.mux_max_pool`：客户端侧最大并发 data-mux 数（防止被误配置拉爆）
+- `client.services.<name>.mux_max_pool`：客户端侧最大并发 data-mux 数（默认 4，允许范围 1..=12，防止被误配置拉爆）
 
 ### Yamux 配置与推荐默认值
 

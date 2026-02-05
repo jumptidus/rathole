@@ -53,7 +53,7 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
         .without_max_times()
         .with_jitter();
     let mut request_backoff = backoff_builder.build();
-    let mut request_sleep = tokio::time::sleep(Duration::from_millis(0));
+    let request_sleep = tokio::time::sleep(Duration::from_millis(0));
     tokio::pin!(request_sleep);
     let mut request_sleep_armed = false;
 
@@ -69,7 +69,6 @@ pub(super) async fn run_udp_connection_pool<T: Transport>(
                                 Ok(Ok(_)) => {
                                     debug!("UDP 连接建立...");
                                     request_backoff = backoff_builder.build();
-                                    request_sleep_armed = false;
                                     break c;
                                 }
                                 Ok(Err(e)) => {

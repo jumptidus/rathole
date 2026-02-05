@@ -1,4 +1,6 @@
-use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType, DEFAULT_MUX_MAX_STREAMS};
+use crate::config::{
+    ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType, DEFAULT_MUX_MAX_STREAMS,
+};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::data_channel_handler::{get_data_channel_tcp_handler, get_data_channel_udp_handler};
 use crate::data_channel_limit::get_data_channel_limiter;
@@ -13,13 +15,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use futures::future::poll_fn;
 use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
+use portable_atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
-use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 use yamux::{Config as YamuxConfig, Connection as YamuxConnection, Mode as YamuxMode};
 
 #[cfg(feature = "noise")]
@@ -230,8 +233,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp(conn, &args.service.name, &args.service.local_addr)
-                .await?;
+            run_data_channel_for_tcp(conn, &args.service.name, &args.service.local_addr).await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
@@ -245,11 +247,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 
 // TCP 数据通道直连处理
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp<S>(
-    conn: S,
-    service_name: &str,
-    _local_addr: &str,
-) -> Result<()>
+async fn run_data_channel_for_tcp<S>(conn: S, service_name: &str, _local_addr: &str) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
 {
@@ -300,8 +298,7 @@ async fn run_data_mux_with_resp<T: Transport>(
         Err(e) => {
             warn!(service = %args.service.name, "mux 握手失败: {:#}", e);
             drop(guard);
-            let active_u16 =
-                active_for_resp.load(Ordering::Acquire).min(u16::MAX as u64) as u16;
+            let active_u16 = active_for_resp.load(Ordering::Acquire).min(u16::MAX as u64) as u16;
             return ControlChannelMuxResp {
                 kind: MuxRespKind::Failed,
                 max_pool: max_pool_u16,
@@ -407,10 +404,10 @@ fn ensure_data_channel_handler(service: &ClientServiceConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TransportConfig;
     use crate::data_channel_handler::{
         unregister_data_channel_tcp_handler, unregister_data_channel_udp_handler,
     };
-    use crate::config::TransportConfig;
     use crate::transport::{AddrMaybeCached, SocketOpts, Transport};
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -454,10 +451,7 @@ mod tests {
             Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 

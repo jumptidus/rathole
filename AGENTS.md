@@ -1,5 +1,23 @@
 # AGENTS
 
+## 项目依赖关系（跨仓库）
+
+### 当前项目定位（rathole）
+
+- `rathole` 是中转服务端，基于 `rapiz1/rathole v0.6.3`。
+- 与边缘节点 `route_proxy` 协同提供 relay 访问路径。
+
+### 直接协作关系
+
+- `route_proxy` 通过 `rathole_client` 与本服务端交互。
+- 与 `mobile`、`tis_windows`、`jy_core` 无源码直接依赖。
+
+### 维护规则
+
+- 服务端配置与协议调整需联动评估 `rathole_client`/`route_proxy` 兼容性。
+- 尽量保持与上游 rathole 版本语义一致，降低维护分叉成本。
+
+
 ## 0 · 关于用户与你的角色
 
 - 你正在协助的对象是 **Snom**。
